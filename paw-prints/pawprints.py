@@ -32,6 +32,7 @@ import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -450,19 +451,24 @@ def paw_rgba(rgb: np.ndarray, mask: np.ndarray, paper: np.ndarray, dpi: int) -> 
 
 def trace_svg(rgba: np.ndarray, dpi: int, detail: str) -> str:
     h, w, _ = rgba.shape
+    preset = DETAIL_PRESETS[detail]
     png = io.BytesIO()
     Image.fromarray(rgba, "RGBA").save(png, "PNG", compress_level=1)
     svg = vtracer.convert_raw_image_to_svg(
+        # Positional on purpose: vtracer 0.6.15 segfaults on Python 3.14 when given keyword arguments.
         png.getvalue(),
-        img_format="png",
-        colormode="color",
-        hierarchical="stacked",
-        mode="spline",
-        corner_threshold=60,
-        length_threshold=4.0,
-        splice_threshold=45,
-        path_precision=2,
-        **DETAIL_PRESETS[detail],
+        "png",  # img_format
+        "color",  # colormode
+        "stacked",  # hierarchical
+        "spline",  # mode
+        preset["filter_speckle"],
+        preset["color_precision"],
+        preset["layer_difference"],
+        60,  # corner_threshold
+        4.0,  # length_threshold
+        10,  # max_iterations
+        45,  # splice_threshold
+        2,  # path_precision
     )
     # Real-world size, so the paw imports into Illustrator/Cricut at its true scale.
     mm_w, mm_h = w / dpi * 25.4, h / dpi * 25.4
@@ -691,15 +697,23 @@ def main(argv: list[str] | None = None) -> int:
 
     start = time.monotonic()
     results: dict[str, list[PageResult]] = {}
-    with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = {pool.submit(process_pdf, str(p), str(p.relative_to(in_dir)), opts): p for p in pdfs}
-        for done, future in enumerate(as_completed(futures), start=1):
-            pages = future.result()
-            results[pages[0].source] = pages
-            icons = {"ok": "✓", "review": "⚑", "skipped": "·", "error": "✗"}
-            summary = ", ".join(f"{icons[p.status]} {p.name or p.reason}" for p in pages)
-            print(f"[{done}/{len(pdfs)}] {pages[0].source}: {summary}", flush=True)
-    ordered = [page for p in pdfs for page in results[str(p.relative_to(in_dir))]]
+    try:
+        with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            futures = {pool.submit(process_pdf, str(p), str(p.relative_to(in_dir)), opts): p for p in pdfs}
+            for done, future in enumerate(as_completed(futures), start=1):
+                pages = future.result()
+                results[pages[0].source] = pages
+                icons = {"ok": "✓", "review": "⚑", "skipped": "·", "error": "✗"}
+                summary = ", ".join(f"{icons[p.status]} {p.name or p.reason}" for p in pages)
+                print(f"[{done}/{len(pdfs)}] {pages[0].source}: {summary}", flush=True)
+    except BrokenProcessPool:
+        # A worker died outright (a crash inside a library). Keep everything already finished.
+        print("\nThe converter crashed partway through. Finished files are saved below; "
+              "the rest are listed as errors in report.csv.")
+    sources = [str(p.relative_to(in_dir)) for p in pdfs]
+    for source in sources:
+        results.setdefault(source, [PageResult(source, 1, 1, "error", reason="converter crashed; not converted")])
+    ordered = [page for source in sources for page in results[source]]
 
     if opts.dry_run:
         print(f"\nDry run finished in {time.monotonic() - start:.0f}s; nothing was written.")
