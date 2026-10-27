@@ -1,0 +1,124 @@
+"""Make fake paw-print scans for testing: textured ink paws and printed labels on off-white paper.
+
+    python tests/make_samples.py OUT_DIR
+"""
+
+from __future__ import annotations
+
+import io
+import sys
+from pathlib import Path
+
+import numpy as np
+import pymupdf
+from PIL import Image, ImageDraw, ImageFilter
+
+DPI = 300
+PAGE_W, PAGE_H = 612, 792  # US Letter, points
+PAPER = (246, 243, 236)
+NAVY = (38, 34, 70)
+BROWN = (92, 48, 30)
+
+
+def paw_image(ink: tuple[int, int, int], seed: int, size_px: int = 900) -> Image.Image:
+    """RGBA paw: a main pad and four toes with mottled ink and paper-colored skin gaps."""
+    rng = np.random.default_rng(seed)
+    s = size_px
+    shape = Image.new("L", (s, s), 0)
+    d = ImageDraw.Draw(shape)
+    d.ellipse((0.22 * s, 0.45 * s, 0.78 * s, 0.95 * s), fill=255)
+    d.polygon([(0.30 * s, 0.62 * s), (0.70 * s, 0.62 * s), (0.82 * s, 0.90 * s), (0.18 * s, 0.90 * s)], fill=255)
+    for cx, cy in ((0.13, 0.42), (0.36, 0.18), (0.64, 0.18), (0.87, 0.42)):
+        d.ellipse(((cx - 0.11) * s, (cy - 0.14) * s, (cx + 0.11) * s, (cy + 0.14) * s), fill=255)
+    shape = shape.filter(ImageFilter.GaussianBlur(3))
+    # Skin texture: little paper-colored gaps where the ink did not take.
+    gaps = Image.new("L", (s, s), 0)
+    g = ImageDraw.Draw(gaps)
+    for _ in range(260):
+        x, y, r = rng.uniform(0, s), rng.uniform(0, s), rng.uniform(2, 7)
+        g.ellipse((x - r, y - r, x + r, y + r), fill=255)
+    alpha = np.asarray(shape, np.float32) / 255 * (1 - np.asarray(gaps, np.float32) / 255 * 0.85)
+    shade = 1 + rng.normal(0, 0.12, (s // 30 + 1, s // 30 + 1))
+    shade = np.asarray(Image.fromarray(shade.astype(np.float32)).resize((s, s), Image.BILINEAR))
+    color = np.clip(np.array(ink, np.float32)[None, None, :] * shade[..., None], 0, 255)
+    rgba = np.dstack([color, alpha * 255]).astype(np.uint8)
+    return Image.fromarray(rgba, "RGBA")
+
+
+def scan_page(paws: list[tuple[Image.Image, tuple[int, int]]], frame: tuple | None = None) -> Image.Image:
+    page = Image.new("RGB", (PAGE_W * DPI // 72, PAGE_H * DPI // 72), PAPER)
+    for paw, xy in paws:
+        page.paste(paw, xy, paw)
+    if frame:
+        ImageDraw.Draw(page).rectangle(frame, outline=(120, 120, 120), width=4)
+    return page
+
+
+def add_scan(doc: pymupdf.Document, page_img: Image.Image, labels: list[tuple[str, float, float, float]],
+             searchable: bool, seed: int) -> None:
+    """Put the 'scanned' page in the PDF. labels: (text, x_pt, y_pt, fontsize)."""
+    # Print the label onto the paper, then "scan" it: noise + JPEG like a real scanner.
+    tmp = pymupdf.open()
+    p = tmp.new_page(width=PAGE_W, height=PAGE_H)
+    buf = io.BytesIO()
+    page_img.save(buf, "PNG")
+    p.insert_image(p.rect, stream=buf.getvalue())
+    for text, x, y, size in labels:
+        p.insert_text((x, y), text, fontsize=size, fontname="helv", color=(0.1, 0.1, 0.1))
+    pix = p.get_pixmap(dpi=DPI)
+    rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[..., :3].astype(np.int16)
+    rgb = np.clip(rgb + np.random.default_rng(seed).normal(0, 2.5, rgb.shape), 0, 255).astype(np.uint8)
+    jpg = io.BytesIO()
+    Image.fromarray(rgb).save(jpg, "JPEG", quality=85)
+
+    page = doc.new_page(width=PAGE_W, height=PAGE_H)
+    page.insert_image(page.rect, stream=jpg.getvalue())
+    if searchable:  # invisible OCR text layer, the way scanners make "searchable PDFs"
+        for text, x, y, size in labels:
+            page.insert_text((x, y), text, fontsize=size, fontname="helv", render_mode=3)
+
+
+def make_samples(out: Path) -> dict[str, dict]:
+    """Write the test PDFs into out/ and return what each one should produce."""
+    out.mkdir(parents=True, exist_ok=True)
+    expected = {}
+
+    def save(name: str, doc: pymupdf.Document, **expect) -> None:
+        doc.save(out / name)
+        expected[name] = expect
+
+    doc = pymupdf.open()
+    add_scan(doc, scan_page([(paw_image(NAVY, 1), (820, 600))]), [("Buddy Smith", 200, 600, 30)], False, 1)
+    save("scan_001.pdf", doc, outputs=["Buddy Smith.svg"], inks=[NAVY])
+
+    doc = pymupdf.open()
+    add_scan(doc, scan_page([(paw_image(BROWN, 2), (820, 500))]),
+             [("Name: Luna Garcia", 180, 560, 26), ("Left front   10/27/2026", 180, 600, 12)], True, 2)
+    save("scan_002.pdf", doc, outputs=["Luna Garcia.svg"], inks=[BROWN])
+
+    doc = pymupdf.open()
+    add_scan(doc, scan_page([(paw_image(NAVY, 3), (820, 900))]), [("MAX", 260, 160, 40)], False, 3)
+    save("scan_003.pdf", doc, outputs=["Max.svg"], inks=[NAVY])
+
+    doc = pymupdf.open()
+    add_scan(doc, scan_page([(paw_image(BROWN, 4), (820, 900))]), [], False, 4)
+    save("scan_004.pdf", doc, outputs=["NEEDS_REVIEW/scan_004.svg"], inks=[BROWN])
+
+    doc = pymupdf.open()  # second dog named Max; label in a sticker frame
+    add_scan(doc, scan_page([(paw_image(NAVY, 5), (820, 500))], frame=(700, 2380, 1850, 2700)),
+             [("Max", 230, 620, 34)], False, 5)
+    save("scan_005.pdf", doc, outputs=["Max (2).svg"], inks=[NAVY])
+
+    doc = pymupdf.open()  # front and back paw on two pages, label only on page 1
+    add_scan(doc, scan_page([(paw_image(BROWN, 6), (820, 500))]), [("Daisy O'Brien", 200, 600, 30)], True, 6)
+    add_scan(doc, scan_page([(paw_image(NAVY, 7, 700), (900, 900))]), [], False, 7)
+    save("scan_006.pdf", doc, outputs=["Daisy O'Brien - 1.svg", "Daisy O'Brien - 2.svg"], inks=[BROWN, NAVY])
+
+    (out / "broken.pdf").write_bytes(b"%PDF-1.4 this is not really a pdf")
+    expected["broken.pdf"] = dict(outputs=[], inks=[])
+    return expected
+
+
+if __name__ == "__main__":
+    for name, expect in make_samples(Path(sys.argv[1])).items():
+        print(name, "->", expect["outputs"])
