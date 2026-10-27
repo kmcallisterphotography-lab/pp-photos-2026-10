@@ -11,13 +11,32 @@ several PDFs at a time.
 1. Put this `paw-prints` folder somewhere handy, e.g. your Documents folder.
 2. Double-click **Convert Paw Prints.command**. The first time, it sets itself up (about a
    minute).
-   - If macOS says it "can't be opened", right-click the file → **Open** → **Open**. You
-     only need to do this once.
+   - If macOS says Apple "could not verify" it is free of malware, see
+     [the macOS warning](#the-macos-malware-warning) below. You only need to do this once.
    - If it says Python 3.10 or newer is needed, install Python from
      <https://www.python.org/downloads/macos/>, then double-click the file again.
 
 The first run sets everything up for you. Running `./setup.sh` in Terminal does the same
 thing by hand.
+
+## The macOS malware warning
+
+macOS shows this warning for any script downloaded from the internet that isn't signed with
+a paid Apple developer certificate. It doesn't mean anything harmful was found. Every file
+here is plain text, so you can open them in TextEdit and read them first.
+
+Clear the warning once for the whole folder, either way:
+
+- **Terminal (covers every file at once):** open Terminal, type
+  `xattr -dr com.apple.quarantine ` (with a space at the end), drag the `paw-prints`
+  folder onto the Terminal window, and press Return. This removes the "downloaded from the
+  internet" tag from the folder and everything in it.
+- **System Settings:** after the warning appears, click **Done**. Go to **System Settings →
+  Privacy & Security**, scroll down to the message about "Convert Paw Prints.command", click
+  **Open Anyway**, and confirm with your password.
+
+Getting the folder with `git clone` instead of a zip download avoids the warning
+altogether, because git doesn't add the tag.
 
 ## Converting a batch
 
