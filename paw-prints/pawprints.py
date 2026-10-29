@@ -39,9 +39,10 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 from scipy.spatial import ConvexHull
 
-VERSION = "2026-10-29c"
+VERSION = "2026-10-29d"
 REVIEW_DIR = "NEEDS_REVIEW"
 REPORT_NAME = "report.csv"
+MIN_PAW_INK_MM2 = 150  # a page with less ink than this inside the paw region has no paw
 
 # Tracing settings. Tracing at 2x the scan resolution keeps fine skin texture and fur strokes
 # crisp; higher detail also keeps more shades of gray and makes bigger files.
@@ -195,7 +196,9 @@ def isolate_paw(ink: np.ndarray, rgb: np.ndarray, dpi: int) -> tuple[np.ndarray,
     else:
         return ink, "no paw found (nothing paw-shaped on the page)"
     ink = ink & region
-    if ink.sum() < 50 * (dpi / 25.4) ** 2:  # under ~50 mm² of ink
+    # The smallest real paw in the 2026-10-29 batch has ~200 mm² of ink; bold label words
+    # ("Breed:", "Birthday:") that passed the pad test have 50-115 mm², so 150 separates them.
+    if ink.sum() < MIN_PAW_INK_MM2 * (dpi / 25.4) ** 2:
         return ink, "no paw found (only small marks on the page)"
     return ink, ""
 
