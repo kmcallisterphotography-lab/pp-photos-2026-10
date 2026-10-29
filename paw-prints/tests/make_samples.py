@@ -94,7 +94,7 @@ def decorate(page: Image.Image) -> Image.Image:
 
 
 def add_scan(doc: pymupdf.Document, page_img: Image.Image, labels: list[tuple[str, float, float, float]],
-             searchable: bool, seed: int) -> None:
+             seed: int) -> None:
     """Put the 'scanned' page in the PDF. labels: (text, x_pt, y_pt, fontsize)."""
     # Print the label onto the paper, then "scan" it: noise + JPEG like a real scanner.
     tmp = pymupdf.open()
@@ -109,63 +109,61 @@ def add_scan(doc: pymupdf.Document, page_img: Image.Image, labels: list[tuple[st
     rgb = np.clip(rgb + np.random.default_rng(seed).normal(0, 2.5, rgb.shape), 0, 255).astype(np.uint8)
     jpg = io.BytesIO()
     Image.fromarray(rgb).save(jpg, "JPEG", quality=85)
-
     page = doc.new_page(width=PAGE_W, height=PAGE_H)
     page.insert_image(page.rect, stream=jpg.getvalue())
-    if searchable:  # invisible OCR text layer, the way scanners make "searchable PDFs"
-        for text, x, y, size in labels:
-            page.insert_text((x, y), text, fontsize=size, fontname="helv", render_mode=3)
 
 
 def make_samples(out: Path) -> dict[str, dict]:
-    """Write the test PDFs into out/ and return what each one should produce."""
+    """Write the test PDFs (named after the patient, like the real ones) and what each should produce."""
     out.mkdir(parents=True, exist_ok=True)
     expected = {}
 
-    def save(name: str, doc: pymupdf.Document, **expect) -> None:
+    def save(name: str, doc: pymupdf.Document, inks: list) -> None:
         doc.save(out / name)
-        expected[name] = expect
+        stem = Path(name).stem
+        outputs = [f"{stem}.svg"] if len(inks) == 1 else [f"{stem} - {n}.svg" for n in range(1, len(inks) + 1)]
+        expected[name] = dict(outputs=outputs, inks=inks)
 
     doc = pymupdf.open()
-    add_scan(doc, scan_page([(paw_image(NAVY, 1), (820, 600))]), [("Buddy Smith", 200, 600, 30)], False, 1)
-    save("scan_001.pdf", doc, outputs=["Buddy Smith.svg"], inks=[NAVY])
+    add_scan(doc, scan_page([(paw_image(NAVY, 1), (820, 600))]), [("Buddy Smith", 200, 600, 30)], 1)
+    save("Buddy Smith.pdf", doc, [NAVY])
 
-    doc = pymupdf.open()
+    doc = pymupdf.open()  # colored ink; label plus a small second line
     add_scan(doc, scan_page([(paw_image(BROWN, 2), (820, 500))]),
-             [("Name: Luna Garcia", 180, 560, 26), ("Left front   10/27/2026", 180, 600, 12)], True, 2)
-    save("scan_002.pdf", doc, outputs=["Luna Garcia.svg"], inks=[BROWN])
+             [("Name: Luna Garcia", 180, 560, 26), ("Left front   10/27/2026", 180, 600, 12)], 2)
+    save("Luna Garcia.pdf", doc, [BROWN])
 
-    doc = pymupdf.open()
-    add_scan(doc, scan_page([(paw_image(NAVY, 3), (820, 900))]), [("MAX", 260, 160, 40)], False, 3)
-    save("scan_003.pdf", doc, outputs=["Max.svg"], inks=[NAVY])
+    doc = pymupdf.open()  # short name in big letters, close above the toes
+    add_scan(doc, scan_page([(paw_image(NAVY, 3), (820, 900))]), [("MAX", 260, 160, 40)], 3)
+    save("Max.pdf", doc, [NAVY])
 
-    doc = pymupdf.open()
-    add_scan(doc, scan_page([(paw_image(BROWN, 4), (820, 900))]), [], False, 4)
-    save("scan_004.pdf", doc, outputs=["NEEDS_REVIEW/scan_004.svg"], inks=[BROWN])
+    doc = pymupdf.open()  # no label at all
+    add_scan(doc, scan_page([(paw_image(BROWN, 4), (820, 900))]), [], 4)
+    save("Coco.pdf", doc, [BROWN])
 
-    doc = pymupdf.open()  # second dog named Max; label in a sticker frame
+    doc = pymupdf.open()  # label in a sticker frame
     add_scan(doc, scan_page([(paw_image(NAVY, 5), (820, 500))], frame=(700, 2380, 1850, 2700)),
-             [("Max", 230, 620, 34)], False, 5)
-    save("scan_005.pdf", doc, outputs=["Max (2).svg"], inks=[NAVY])
+             [("Rex", 230, 620, 34)], 5)
+    save("Rex.pdf", doc, [NAVY])
 
-    doc = pymupdf.open()  # front and back paw on two pages, label only on page 1
-    add_scan(doc, scan_page([(paw_image(BROWN, 6), (820, 500))]), [("Daisy O'Brien", 200, 600, 30)], True, 6)
-    add_scan(doc, scan_page([(paw_image(NAVY, 7, 700), (900, 900))]), [], False, 7)
-    save("scan_006.pdf", doc, outputs=["Daisy O'Brien - 1.svg", "Daisy O'Brien - 2.svg"], inks=[BROWN, NAVY])
+    doc = pymupdf.open()  # front and back paw on two pages
+    add_scan(doc, scan_page([(paw_image(BROWN, 6), (820, 500))]), [("Daisy O'Brien", 200, 600, 30)], 6)
+    add_scan(doc, scan_page([(paw_image(NAVY, 7, 700), (900, 900))]), [], 7)
+    save("Daisy O'Brien.pdf", doc, [BROWN, NAVY])
 
     doc = pymupdf.open()  # black ink plus the hearts and lines staff draw on the sheet
-    add_scan(doc, decorate(scan_page([(paw_image(BLACK, 8), (820, 600))])), [("Rosie Parker", 200, 640, 30)], False, 8)
-    save("scan_007.pdf", doc, outputs=["Rosie Parker.svg"], inks=[BLACK])
+    add_scan(doc, decorate(scan_page([(paw_image(BLACK, 8), (820, 600))])), [("Rosie Parker", 200, 640, 30)], 8)
+    save("Rosie Parker.pdf", doc, [BLACK])
 
     doc = pymupdf.open()  # white card on a grayer scanner lid, with a faint print
     add_scan(doc, card_page((226, 226, 224), (254, 254, 253), paw_image(BLACK, 9, faint=True)),
-             [("Brownie Cole", 80, 400, 26)], False, 9)
-    save("scan_008.pdf", doc, outputs=["Brownie Cole.svg"], inks=[BLACK])
+             [("Brownie Cole", 80, 400, 26)], 9)
+    save("Brownie Cole.pdf", doc, [BLACK])
 
     doc = pymupdf.open()  # cream card on a white lid
     add_scan(doc, card_page((250, 250, 250), (240, 232, 214), paw_image(BLACK, 10)),
-             [("Pepper Lane", 80, 400, 26)], False, 10)
-    save("scan_009.pdf", doc, outputs=["Pepper Lane.svg"], inks=[BLACK])
+             [("Pepper Lane", 80, 400, 26)], 10)
+    save("Pepper Lane.pdf", doc, [BLACK])
 
     (out / "broken.pdf").write_bytes(b"%PDF-1.4 this is not really a pdf")
     expected["broken.pdf"] = dict(outputs=[], inks=[])

@@ -1,10 +1,8 @@
 # Paw Prints → SVG
 
-Turns a folder of scanned paw-print PDFs into SVGs with a **transparent background**,
-each named after the dog on its printed label (`Buddy Smith.svg`, or `Buddy.svg` when the
-label only has a first name). Anything it can't name confidently goes to a
-`NEEDS_REVIEW` folder for you to name by hand. The whole folder is processed in one go,
-several PDFs at a time.
+Turns a folder of scanned paw-print PDFs into grayscale SVGs of just the paw, on a
+**transparent background**. Each SVG gets the same name as its PDF (`Brown.pdf` →
+`Brown.svg`). The whole folder is processed in one go, several PDFs at a time.
 
 ## One-time setup (Mac)
 
@@ -50,45 +48,40 @@ is ever overwritten. Your PDFs are never changed.
 
 ```
 paw-scans-svg/
+  Brown.svg
   Buddy Smith.svg
-  Max.svg
-  Max (2).svg              ← a second dog named Max
-  Daisy O'Brien - 1.svg    ← a PDF with two paws (two pages)
+  Daisy O'Brien - 1.svg    ← a PDF with two pages gives one SVG per page
   Daisy O'Brien - 2.svg
   NEEDS_REVIEW/
-    scan_0042.svg          ← finished and transparent; it just needs the dog's name
-    scan_0042-label.png    ← picture of the label (or the page) so you can read the name
-  report.csv               ← one line per page: name read, confidence, and any problem
+    Coco.svg               ← finished, but worth a look
+    Coco-page.png          ← the original page, to compare against
+  report.csv               ← one line per page, with any problem noted
 ```
 
-**What to do with NEEDS_REVIEW:** open the `-label.png`, then rename the matching `.svg` to
-the dog's name. The SVG is already done. A file lands here when:
+The terminal also shows the converter's version when it starts. If a fix doesn't seem to
+take, check that line.
 
-- there's no label, or the label has no readable name;
-- two different lines look equally like the name (for example "Bella" and "Coco" in the same size);
-- OCR wasn't confident about what it read;
-- the print is too faint or broken up to pick out the paw's shape, so everything on the
-  sheet was kept. Check it and erase any extras. If a name was read, the file already has
-  it.
+**What to do with NEEDS_REVIEW:** compare the SVG with its `-page.png` and erase anything
+that isn't paw. A file lands here when:
+
+- the print is too faint or broken up to pick out the paw's shape, so every solid mark on
+  the sheet was kept;
+- the SVG seems to contain a leftover background.
 
 ## What it does to each scan
 
-1. Reads the label from the PDF's own text if the scanner made it searchable. Otherwise it
-   uses Apple's built-in text recognition, which is free, runs on your Mac, and needs no
-   account.
-2. Picks the name. A `Name: ...` field wins. Otherwise it takes the largest line that looks
-   like a name. Lines like `Owner: ...`, dates, and "left front" are ignored. ALL-CAPS names
-   are changed to normal capitalization (`BUDDY SMITH` → `Buddy Smith`).
-3. Keeps only the paw. It removes:
-   - the label;
+1. Finds the ink: anything noticeably darker than the paper around it. Paper is judged
+   locally, so a card that's a different white from the scanner lid doesn't count as ink.
+2. Keeps only the paw. It removes:
    - red or other colored marks, such as hearts, when the paw is in black ink;
-   - anything thinner than about 2.5 mm, such as pen lines, heart outlines and writing;
-   - anything that isn't the main pad or one of the toe pads close to it, such as stamped
-     hearts elsewhere on the sheet.
-4. Removes the paper. Anything close to the paper color becomes transparent, including
+   - anything thinner than about 2.5 mm, such as pen lines, card edges, heart outlines and
+     writing;
+   - anything that isn't the main pad or one of the toe pads close to it, such as the label
+     or stamped hearts elsewhere on the sheet.
+3. Removes the paper. Anything close to the paper color becomes transparent, including
    the little gaps in the paw's skin texture. Edges are cleaned up so there's no white
    halo when the paw sits on a dark background.
-5. Traces the paw in **grayscale** and saves the SVG at its **true physical size** (in mm),
+4. Traces the paw in **grayscale** and saves the SVG at its **true physical size** (in mm),
    so it imports into Illustrator, Cricut Design Space, and similar tools at the right
    scale.
 
@@ -102,11 +95,8 @@ To use options, run the script in Terminal from this folder:
 
 | Option | What it does |
 |---|---|
-| `--dry-run` | List the name it would use for each PDF without writing anything. Good for a quick check. |
 | `--detail low/medium/high` | How much ink texture and shading to keep. `high` keeps the most texture and makes bigger files. Default is `medium`. |
 | `--out FOLDER` | Put the results somewhere else. |
-| `--name-pattern REGEX` | Tell it exactly where the name is, if your labels have a fixed layout. Example: `--name-pattern 'Pet: (?P<name>.+)'` |
-| `--min-confidence 0.5` | Flag names read with OCR confidence below this (0–1). |
 | `--threshold 25` | How much darker than the paper around it a spot must be to count as ink (0–255). Lower it if faint ink is lost; raise it if paper smudges or card edges show up. Default is 25. |
 | `--workers N` | How many PDFs to process at once. Defaults to one per CPU core, up to 8. |
 | `--open` | Open the results folder in Finder when done. The launcher uses this. |
@@ -119,9 +109,8 @@ To use options, run the script in Terminal from this folder:
   and any hearts or drawings, a little away from the paw, about an inch. A solid black mark
   touching the paw or sitting right between the toes can't be told apart from the paw, so it
   stays in.
-- **Not on a Mac?** The script also runs on Windows or Linux with
-  [Tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html) installed for
-  reading labels. Labels on a big colored sticker aren't removed automatically yet.
+- **Not on a Mac?** The script also runs on Windows or Linux; only the double-click launcher
+  is Mac-specific.
 
 ## Tests
 
@@ -132,7 +121,7 @@ To use options, run the script in Terminal from this folder:
 
 The tests generate fake scans (`tests/make_samples.py`) and check the following:
 
-- file names and which files get flagged
+- each SVG is named after its PDF, with no overwrites and same-named PDFs numbered
 - `report.csv` contents
 - each SVG is grayscale on a transparent background
 - the label, hearts, pen lines and marker strokes are removed, leaving only the paw

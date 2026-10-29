@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""Bulk-convert paw-print PDF scans into transparent-background SVGs.
+"""Bulk-convert paw-print PDF scans into grayscale SVGs with a transparent background.
 
-Each PDF holds a scanned paw print on white paper plus a printed label with the
-dog's name. For every page the script:
+Each PDF is already named after the patient (e.g. "Brown.pdf"). For every page the script:
 
-  1. renders the page and reads the label (PDF text layer, else OCR),
-  2. picks the dog's name and cleans it into a file name,
-  3. removes the label and the paper so only the inked paw is left,
-  4. traces the paw in color with vtracer into an SVG with no background,
-  5. saves "<Dog Name>.svg", or puts it in NEEDS_REVIEW/ when no name is found.
+  1. renders the page and finds the ink: anything darker than the paper around it,
+  2. keeps only the paw: drops colored marks, thin lines, writing, and anything that
+     isn't a main pad or a toe pad near it,
+  3. removes the paper so only the paw is left, in grayscale,
+  4. traces it with vtracer and saves "<PDF name>.svg" ("<PDF name> - 2.svg" for a second page).
 
 Usage:
-    ./pawprints.py ~/Desktop/paw-scans            # writes ~/Desktop/paw-scans-svg/
-    ./pawprints.py ~/Desktop/paw-scans --dry-run  # only show the names it would use
+    ./pawprints.py ~/Desktop/paw-scans    # writes ~/Desktop/paw-scans-svg/
 
 Run ./pawprints.py --help for all options.
 """
@@ -25,11 +23,9 @@ import io
 import math
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
-import unicodedata
 import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
@@ -42,8 +38,10 @@ import vtracer
 from PIL import Image, ImageFilter
 from scipy import ndimage
 
+VERSION = "2026-10-29"
 REVIEW_DIR = "NEEDS_REVIEW"
 REPORT_NAME = "report.csv"
+NO_CLEAR_PAW = "couldn't find a clear paw shape; check that only the paw was kept"
 
 # vtracer settings. Higher detail keeps more of the ink texture and makes bigger files.
 DETAIL_PRESETS = {
@@ -52,47 +50,12 @@ DETAIL_PRESETS = {
     "high": dict(filter_speckle=2, color_precision=7, layer_difference=8),
 }
 
-# Label fields that hold the dog's name ("Name: Buddy Smith", "Pet's name - Buddy").
-NAME_FIELD_RE = re.compile(
-    r"^\s*(?:(?:dog|pet|puppy|patient)(?:'?s)?\s+)?name\b\s*[:\-–—=]?\s*(?P<name>.*)$",
-    re.IGNORECASE,
-)
-FIRST_FIELD_RE = re.compile(r"^\s*first(?:\s+name)?\s*[:\-–—=]\s*(?P<name>.*)$", re.IGNORECASE)
-LAST_FIELD_RE = re.compile(r"^\s*(?:last|family|sur)\s*(?:name)?\s*[:\-–—=]\s*(?P<name>.*)$", re.IGNORECASE)
-# Any other "Key: value" line (Owner:, Date:, Breed:) is never the dog's name.
-OTHER_FIELD_RE = re.compile(r"^\s*[^\W\d_][\w' ]{0,24}\s*[:=]")
-MEMORIAL_PREFIX_RE = re.compile(r"^\s*(?:in\s+(?:loving\s+)?memory\s+of|r\.?i\.?p\.?)\s+", re.IGNORECASE)
-NAME_WORD_RE = re.compile(r"^[^\W\d_](?:[^\W\d_]|['.\-])*$")
-# Words that show up on labels but are never part of a dog's name.
-STOPWORDS = {
-    "paw", "paws", "print", "prints", "pawprint", "pawprints", "left", "right", "front",
-    "back", "rear", "hind", "nose", "date", "dob", "breed", "owner", "clinic", "hospital",
-    "veterinary", "vet", "scan", "page", "name", "memory", "loving", "forever", "rip",
-}
-FILENAME_BAD_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
-NO_NAME = "no name found on label"
-
 
 @dataclass
 class Options:
     dpi: int = 300
     detail: str = "medium"
-    ocr: str = "auto"
     threshold: float | None = None
-    min_confidence: float = 0.5
-    name_pattern: str | None = None
-    dry_run: bool = False
-
-
-@dataclass
-class TextLine:
-    text: str
-    conf: float
-    box: tuple[float, float, float, float]  # x0, y0, x1, y1 in page pixels
-
-    @property
-    def height(self) -> float:
-        return self.box[3] - self.box[1]
 
 
 @dataclass
@@ -101,220 +64,12 @@ class PageResult:
     page: int
     page_count: int
     status: str  # "ok", "review", "skipped" or "error"
-    name: str | None = None
-    confidence: float | None = None
-    text_source: str = ""
     reason: str = ""
     svg: str | None = None
     preview_png: bytes | None = None
-    label_missing: bool = False  # no name text at all, as opposed to an unclear one
-    stem: str = ""
 
 
-# ---------------------------------------------------------------- reading text
-
-
-def text_layer_lines(page: pymupdf.Page, dpi: int) -> list[TextLine]:
-    """Lines from the PDF's own text layer (searchable scans), in page pixels."""
-    scale = dpi / 72
-    lines = []
-    for block in page.get_text("dict").get("blocks", []):
-        for line in block.get("lines", []):
-            spans = [s for s in line["spans"] if s["text"].strip()]
-            if not spans:
-                continue
-            text = " ".join(s["text"].strip() for s in spans)
-            x0 = min(s["bbox"][0] for s in spans) * scale
-            y0 = min(s["bbox"][1] for s in spans) * scale
-            x1 = max(s["bbox"][2] for s in spans) * scale
-            y1 = max(s["bbox"][3] for s in spans) * scale
-            lines.append(TextLine(text, 1.0, (x0, y0, x1, y1)))
-    return lines
-
-
-def pick_ocr_backend(requested: str) -> str:
-    if requested != "auto":
-        return requested
-    if sys.platform == "darwin":
-        try:
-            import ocrmac  # noqa: F401
-
-            return "vision"
-        except ImportError:
-            pass
-    if shutil.which("tesseract"):
-        return "tesseract"
-    return "none"
-
-
-def ocr_vision(img: Image.Image) -> list[TextLine]:
-    from ocrmac import ocrmac
-
-    results = ocrmac.OCR(img, recognition_level="accurate", language_preference=["en-US"]).recognize(px=True)
-    return [TextLine(text, float(conf), tuple(box)) for text, conf, box in results]
-
-
-def ocr_tesseract(img: Image.Image) -> list[TextLine]:
-    # Tesseract is faster and finds sparse label text more reliably at ~150 DPI than at 300.
-    scale = 0.5 if min(img.size) > 2000 else 1.0
-    small = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS) if scale < 1 else img
-    buf = io.BytesIO()
-    small.save(buf, "PNG")
-    out = subprocess.run(
-        ["tesseract", "stdin", "stdout", "--psm", "11", "tsv"],
-        input=buf.getvalue(),
-        capture_output=True,
-        check=True,
-        env={**os.environ, "OMP_THREAD_LIMIT": "1"},  # the batch already runs one worker per core
-    ).stdout.decode("utf-8", "replace")
-    rows = list(csv.DictReader(io.StringIO(out), delimiter="\t", quoting=csv.QUOTE_NONE))
-    grouped: dict[tuple, list[dict]] = {}
-    for row in rows:
-        if row.get("level") == "5" and (row.get("text") or "").strip():
-            key = (row["block_num"], row["par_num"], row["line_num"])
-            grouped.setdefault(key, []).append(row)
-    lines = []
-    for words in grouped.values():
-        x0 = min(int(w["left"]) for w in words) / scale
-        y0 = min(int(w["top"]) for w in words) / scale
-        x1 = max(int(w["left"]) + int(w["width"]) for w in words) / scale
-        y1 = max(int(w["top"]) + int(w["height"]) for w in words) / scale
-        conf = min(float(w["conf"]) for w in words) / 100
-        lines.append(TextLine(" ".join(w["text"].strip() for w in words), conf, (x0, y0, x1, y1)))
-    return lines
-
-
-def run_ocr(img: Image.Image, backend: str) -> list[TextLine]:
-    if backend == "vision":
-        return ocr_vision(img)
-    if backend == "tesseract":
-        return ocr_tesseract(img)
-    return []
-
-
-def merge_row_fragments(lines: list[TextLine]) -> list[TextLine]:
-    """Join pieces of one printed line that OCR returned separately ("Buddy" + "Smith")."""
-    merged: list[TextLine] = []
-    for line in sorted(lines, key=lambda l: l.box[0]):
-        for i, prev in enumerate(merged):
-            h = max(prev.height, line.height, 1)
-            same_row = abs((prev.box[1] + prev.box[3]) / 2 - (line.box[1] + line.box[3]) / 2) < 0.4 * h
-            similar = 0.75 <= line.height / max(prev.height, 1) <= 1.33
-            gap = line.box[0] - prev.box[2]
-            if same_row and similar and -0.2 * h <= gap < 1.5 * h:
-                merged[i] = TextLine(
-                    f"{prev.text} {line.text}",
-                    min(prev.conf, line.conf),
-                    (prev.box[0], min(prev.box[1], line.box[1]), line.box[2], max(prev.box[3], line.box[3])),
-                )
-                break
-        else:
-            merged.append(line)
-    return merged
-
-
-# ---------------------------------------------------------------- picking the name
-
-
-def clean_name(raw: str) -> str:
-    name = unicodedata.normalize("NFC", raw).replace("’", "'").replace("‘", "'")
-    name = MEMORIAL_PREFIX_RE.sub("", name)
-    name = FILENAME_BAD_CHARS.sub(" ", name)
-    name = re.sub(r"\s+", " ", name).strip(" .-_,;")
-    letters = [c for c in name if c.isalpha()]
-    if letters and (all(c.isupper() for c in letters) or all(c.islower() for c in letters)):
-        name = re.sub(r"[^\W\d_]+", lambda m: m.group(0).capitalize(), name)
-    return name[:80].strip()
-
-
-def looks_like_name(text: str) -> bool:
-    text = MEMORIAL_PREFIX_RE.sub("", text).strip(" .,;")
-    words = text.replace("’", "'").split()
-    if not 1 <= len(words) <= 4:
-        return False
-    if any(not NAME_WORD_RE.match(w) or w.lower().strip(".") in STOPWORDS for w in words):
-        return False
-    return sum(c.isalpha() for c in text) >= 2
-
-
-def name_words(value: str) -> str:
-    """The name at the start of a field value: "Buddy Smith 10/27/26" -> "Buddy Smith"."""
-    words = []
-    for word in value.replace("’", "'").split():
-        if not NAME_WORD_RE.match(word) or word.lower().strip(".") in STOPWORDS or len(words) == 4:
-            break
-        words.append(word)
-    return " ".join(words)
-
-
-def field_value(lines: list[TextLine], idx: int, regex: re.Pattern) -> tuple[str, float] | None:
-    """Value of a "Key: value" field, or of the line just below a bare "Key:" line."""
-    line = lines[idx]
-    value = regex.match(line.text).group("name").strip()
-    if value:
-        return name_words(value), line.conf
-    below = [
-        l for l in lines
-        if l is not line
-        and 0 <= l.box[1] - line.box[3] < 2 * line.height
-        and l.box[0] < line.box[2] + line.height and l.box[2] > line.box[0]
-    ]
-    if below:
-        nearest = min(below, key=lambda l: l.box[1])
-        return name_words(nearest.text), nearest.conf
-    return None
-
-
-def choose_name(lines: list[TextLine], opts: Options) -> tuple[str | None, float | None, str]:
-    """Return (name, confidence, reason). A None name means the page needs review."""
-    if opts.name_pattern:
-        pattern = re.compile(opts.name_pattern, re.IGNORECASE)
-        for line in lines:
-            m = pattern.search(line.text)
-            if m:
-                raw = m.groupdict().get("name") or (m.group(1) if m.groups() else m.group(0))
-                return finish_name(raw, line.conf, opts, "matched --name-pattern")
-        return None, None, NO_NAME + " (nothing matched --name-pattern)"
-
-    full = first = last = None
-    for i, line in enumerate(lines):
-        if NAME_FIELD_RE.match(line.text):
-            full = full or field_value(lines, i, NAME_FIELD_RE)
-        elif FIRST_FIELD_RE.match(line.text):
-            first = first or field_value(lines, i, FIRST_FIELD_RE)
-        elif LAST_FIELD_RE.match(line.text):
-            last = last or field_value(lines, i, LAST_FIELD_RE)
-    if first:
-        raw = first[0] + (" " + last[0] if last else "")
-        return finish_name(raw, min(first[1], last[1]) if last else first[1], opts, "first/last name fields")
-    if full:
-        return finish_name(full[0], full[1], opts, "name field")
-
-    candidates = [l for l in lines if not OTHER_FIELD_RE.match(l.text) and looks_like_name(l.text)]
-    if not candidates:
-        return None, None, NO_NAME if lines else NO_NAME + " (no text on page)"
-    candidates.sort(key=lambda l: l.height, reverse=True)
-    best = candidates[0]
-    rivals = [
-        c for c in candidates[1:]
-        if c.height >= 0.9 * best.height and clean_name(c.text).lower() != clean_name(best.text).lower()
-    ]
-    if rivals:
-        options = " / ".join(f"'{clean_name(c.text)}'" for c in [best, *rivals[:2]])
-        return None, best.conf, f"more than one possible name: {options}"
-    return finish_name(best.text, best.conf, opts, "largest name-like text")
-
-
-def finish_name(raw: str, conf: float, opts: Options, how: str) -> tuple[str | None, float, str]:
-    name = clean_name(raw)
-    if not name or not any(c.isalpha() for c in name):
-        return None, conf, f"{how}, but it was empty"
-    if conf < opts.min_confidence:
-        return None, conf, f"low OCR confidence ({conf:.2f}) reading '{name}'"
-    return name, conf, how
-
-
-# ---------------------------------------------------------------- finding the paw
+# ---------------------------------------------------------------- finding the ink
 
 
 def color_distance2(rgb: np.ndarray, paper: np.ndarray) -> np.ndarray:
@@ -358,19 +113,7 @@ def ink_mask(rgb: np.ndarray, threshold: float | None, dpi: int) -> np.ndarray:
     return ink
 
 
-def is_printed_text(line: TextLine, ink: np.ndarray) -> bool:
-    """False for "text" OCR imagined on the paw: real letters are thin strokes, toes are solid blobs."""
-    h, w = ink.shape
-    x0, y0 = max(0, int(line.box[0])), max(0, int(line.box[1]))
-    x1, y1 = min(w, int(math.ceil(line.box[2]))), min(h, int(math.ceil(line.box[3])))
-    box = ink[y0:y1, x0:x1]
-    if box.size == 0 or not box.any():
-        return box.size > 0  # invisible text-layer text with no ink under it is still text
-    if box.mean() > 0.45:
-        return False
-    k = max(1, round(0.04 * line.height))  # close ink texture so a mottled toe counts as solid
-    closed = ndimage.binary_closing(np.pad(box, k + 1), iterations=k)
-    return ndimage.distance_transform_edt(closed).max() <= 0.2 * line.height
+# ---------------------------------------------------------------- keeping only the paw
 
 
 def grow(mask: np.ndarray, radius: float) -> np.ndarray:
@@ -394,31 +137,42 @@ def drop_colored_marks(ink: np.ndarray, rgb: np.ndarray) -> np.ndarray:
     return ink & (chroma <= 50)
 
 
-def paw_region(ink: np.ndarray, dpi: int) -> np.ndarray | None:
-    """Where the paw is: each main pad plus the toe pads around it. None if no paw-like shape."""
+def paw_region(ink: np.ndarray, dpi: int, close_mm: float, density: float) -> tuple[np.ndarray, bool]:
+    """(region to keep, whether a paw was found).
+
+    Found: the region covers each main pad and the toe pads near it. Not found: it covers every
+    solid shape on the page, which still leaves out lines and writing.
+    """
     h, w = ink.shape
     f = max(1, round(dpi / 100))  # work at ~100 DPI; plenty for finding shapes
     hh, ww = math.ceil(h / f), math.ceil(w / f)
     padded = np.zeros((hh * f, ww * f), bool)
     padded[:h, :w] = ink
-    coarse = padded.reshape(hh, f, ww, f).mean(axis=(1, 3)) >= 0.35
+    coarse = padded.reshape(hh, f, ww, f).mean(axis=(1, 3)) >= density
     mm = dpi / f / 25.4  # coarse pixels per mm
+
+    def full_size(region: np.ndarray) -> np.ndarray:
+        return np.repeat(np.repeat(grow(region, 1.5 * mm), f, axis=0), f, axis=1)[:h, :w]
+
     # Fill the skin texture so each pad is one solid shape, then drop everything thinner than
-    # 2.5 mm: pen lines, drawn heart outlines, handwriting.
-    solid = shrink(grow(coarse, 1.0 * mm), 1.0 * mm)
+    # 2.5 mm: pen lines, drawn heart outlines, card edges.
+    solid = shrink(grow(coarse, close_mm * mm), close_mm * mm)
     solid = grow(shrink(solid, 1.25 * mm), 1.25 * mm)
     cores, count = ndimage.label(solid)
-    if count == 0:
-        return None
     areas = np.bincount(cores.ravel(), minlength=count + 1)
-    blobs = []  # roundish solid shapes, like pads: not bars, frames, cards or stickers
+    # Pads have truly solid ink somewhere (2 mm across); printed letters are ~1 mm strokes, so a
+    # word that the filling-in turned into a block doesn't.
+    has_solid_ink = np.zeros(count + 1, bool)
+    has_solid_ink[np.unique(cores[shrink(coarse, 1.0 * mm)])] = True
+    blobs = []  # roundish solid shapes, like pads: not bars, frames, cards, stickers or words
     for idx, (ys, xs) in enumerate(ndimage.find_objects(cores), start=1):
         bh, bw = ys.stop - ys.start, xs.stop - xs.start
         fill = areas[idx] / (bh * bw)
-        if 0.3 <= fill <= 0.9 and max(bh, bw) <= 3 * min(bh, bw) and max(bh, bw) <= 160 * mm:
+        if (0.3 <= fill <= 0.9 and max(bh, bw) <= 3 * min(bh, bw) and max(bh, bw) <= 160 * mm
+                and has_solid_ink[idx]):
             blobs.append(idx)
     if not blobs:
-        return None
+        return full_size(solid), False
     largest = max(areas[i] for i in blobs)
     keep = np.zeros(count + 1, bool)
     for pad in [i for i in blobs if areas[i] >= 0.35 * largest]:  # main pads (two if two paws)
@@ -428,65 +182,28 @@ def paw_region(ink: np.ndarray, dpi: int) -> np.ndarray | None:
         dist = ndimage.distance_transform_edt(cores != pad)
         for idx, nearest in zip(blobs, ndimage.minimum(dist, labels=cores, index=blobs)):
             keep[idx] |= nearest <= reach
-    region = grow(keep[cores], 1.5 * mm)
-    return np.repeat(np.repeat(region, f, axis=0), f, axis=1)[:h, :w]
+    return full_size(keep[cores]), True
 
 
-def isolate_paw(ink: np.ndarray, rgb: np.ndarray, lines: list[TextLine], dpi: int) -> tuple[np.ndarray, str, str]:
+def isolate_paw(ink: np.ndarray, rgb: np.ndarray, dpi: int) -> tuple[np.ndarray, str, str]:
     """(mask of just the paw, reason there is no paw, warning that needs a person to check)."""
-    ink = ink.copy()
-    h, w = ink.shape
-    labels, count = ndimage.label(ink, structure=np.ones((3, 3), bool))
-    if count == 0:
+    if not ink.any():
         return ink, "no paw found (page is blank)", ""
-    areas = np.bincount(labels.ravel(), minlength=count + 1)
-    areas[0] = 0
-    largest = areas.max()
-
-    # Remove the label: letters, underlines and frames that sit on OCR text boxes.
-    text_boxes = []
-    for line in lines:
-        if sum(c.isalnum() for c in line.text) >= 2:
-            pad = 0.25 * line.height
-            text_boxes.append((max(0, int(line.box[0] - pad)), max(0, int(line.box[1] - pad)),
-                               min(w, int(line.box[2] + pad) + 1), min(h, int(line.box[3] + pad) + 1)))
-    if text_boxes:
-        on_text = np.zeros_like(ink)
-        for x0, y0, x1, y1 in text_boxes:
-            on_text[y0:y1, x0:x1] = True
-        overlap = np.bincount(labels[on_text].ravel(), minlength=count + 1)
-        slices = ndimage.find_objects(labels)
-        remove = np.zeros(count + 1, bool)
-        for idx in np.nonzero(overlap[1:])[0] + 1:
-            ys, xs = slices[idx - 1]
-            inside_box = any(x0 <= xs.start and xs.stop <= x1 and y0 <= ys.start and ys.stop <= y1
-                             for x0, y0, x1, y1 in text_boxes)
-            if inside_box or (overlap[idx] / areas[idx] >= 0.5 and areas[idx] < 0.1 * largest):
-                remove[idx] = True  # a letter, or a mark sitting on the label
-                continue
-            encloses_text = any(xs.start <= (x0 + x1) / 2 < xs.stop and ys.start <= (y0 + y1) / 2 < ys.stop
-                                for x0, y0, x1, y1 in text_boxes)
-            fill = areas[idx] / ((ys.stop - ys.start) * (xs.stop - xs.start))
-            if encloses_text and fill < 0.15:
-                remove[idx] = True  # a thin frame or sticker edge around the label
-        ink[remove[labels]] = False
-
     ink = drop_colored_marks(ink, rgb)
-    region = paw_region(ink, dpi)
-    warning = ""
-    if region is None:
-        # Very faint or broken-up print: keep all the ink and let a person check it.
-        warning = "couldn't find a clear paw shape; check that only the paw was kept"
-    else:
-        ink &= region
-
+    # A faint, patchy print needs more filling-in before its pads look solid.
+    for close_mm, density in ((1.0, 0.35), (2.5, 0.2)):
+        region, found = paw_region(ink, dpi, close_mm, density)
+        if found:
+            break
+    if found or region.any():
+        ink = ink & region
     if ink.sum() < 50 * (dpi / 25.4) ** 2:  # under ~50 mm² of ink
         return ink, "no paw found (only small marks on the page)", ""
-    return ink, "", warning
+    return ink, "", "" if found else NO_CLEAR_PAW
 
 
 def paw_rgba(rgb: np.ndarray, mask: np.ndarray, ink: np.ndarray, dpi: int) -> np.ndarray:
-    """Crop to the paw and make everything that is not ink fully transparent."""
+    """Crop to the paw, make everything that is not ink fully transparent, and go grayscale."""
     ys, xs = np.nonzero(mask)
     margin = round(2 / 25.4 * dpi)
     y0, y1 = max(0, ys.min() - margin), min(rgb.shape[0], ys.max() + margin + 1)
@@ -585,81 +302,42 @@ def process_pdf(pdf_path: str, source: str, opts: Options) -> list[PageResult]:
         doc = pymupdf.open(pdf_path)
     except Exception as e:  # noqa: BLE001 - report unreadable files and keep going
         return [PageResult(source, 1, 1, "error", reason=f"could not open PDF: {e}")]
-    backend = pick_ocr_backend(opts.ocr)
     with doc:
         if doc.page_count == 0:
             return [PageResult(source, 1, 0, "error", reason="PDF has no pages")]
         for index, page in enumerate(doc):
             result = PageResult(source, index + 1, doc.page_count, "error")
             try:
-                convert_page(page, opts, backend, result)
+                convert_page(page, opts, result)
             except Exception as e:  # noqa: BLE001
                 result.status, result.reason = "error", f"{type(e).__name__}: {e}"
             results.append(result)
-    # A page with no label of its own (e.g. the second paw) takes the name from the labeled page.
-    doc_name = next((r.name for r in results if r.name), None)
-    for r in results:
-        if doc_name and r.name is None and r.label_missing and r.status in ("ok", "review"):
-            r.name = doc_name
-            if r.reason.startswith(NO_NAME):  # flagged only because this page had no label
-                r.status, r.reason = "ok", "name from another page of this PDF"
     return results
 
 
-def convert_page(page: pymupdf.Page, opts: Options, backend: str, result: PageResult) -> None:
+def convert_page(page: pymupdf.Page, opts: Options, result: PageResult) -> None:
     pix = page.get_pixmap(dpi=opts.dpi, colorspace=pymupdf.csRGB, alpha=False)
     rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3)
-    img = Image.fromarray(rgb)
-
     ink = ink_mask(rgb, opts.threshold, opts.dpi)
-
-    def real_text(found: list[TextLine]) -> list[TextLine]:
-        return merge_row_fragments([l for l in found if l.conf >= 0.2 and is_printed_text(l, ink)])
-
-    lines, result.text_source = real_text(text_layer_lines(page, opts.dpi)), "pdf text"
-    name, conf, reason = choose_name(lines, opts)
-    if name is None and backend != "none":
-        ocr_lines = real_text(run_ocr(img, backend))
-        if ocr_lines:
-            lines, result.text_source = ocr_lines, backend
-            name, conf, reason = choose_name(lines, opts)
-    if not lines:
-        result.text_source = backend if backend != "none" else "no OCR available"
-    result.name, result.confidence = name, conf
-    result.label_missing = name is None and reason.startswith(NO_NAME)
-
-    mask, no_paw, warning = isolate_paw(ink, rgb, lines, opts.dpi)
+    mask, no_paw, warning = isolate_paw(ink, rgb, opts.dpi)
     if no_paw:
         result.status, result.reason = "skipped", no_paw
-        return
-    result.status = "ok" if name and not warning else "review"
-    result.reason = warning or reason
-    if result.status == "review":
-        result.preview_png = label_preview(img, [] if warning else lines)
-    if opts.dry_run:
         return
     svg = trace_svg(paw_rgba(rgb, mask, ink, opts.dpi), opts.dpi, opts.detail)
     problem = background_problem(svg)
     if problem:
-        result.status, result.reason = "review", f"possible background left in SVG: {problem}"
-        result.preview_png = result.preview_png or label_preview(img, lines)
-    result.svg = svg
+        warning = f"possible background left in SVG: {problem}"
+    result.status, result.reason, result.svg = ("review" if warning else "ok"), warning, svg
+    if warning:
+        result.preview_png = page_preview(rgb)
 
 
-def label_preview(img: Image.Image, lines: list[TextLine]) -> bytes:
-    """PNG of the label area (or the whole page) so a person can read the name fast."""
-    boxes = [l.box for l in lines if sum(c.isalnum() for c in l.text) >= 2]
-    if boxes:
-        pad = 0.05 * min(img.size)
-        crop = img.crop((
-            max(0, min(b[0] for b in boxes) - pad), max(0, min(b[1] for b in boxes) - pad),
-            min(img.width, max(b[2] for b in boxes) + pad), min(img.height, max(b[3] for b in boxes) + pad),
-        ))
-    else:
-        crop = img.copy()
-    crop.thumbnail((1600, 1600))
+def page_preview(rgb: np.ndarray) -> bytes:
+    """Small PNG of the original page, to compare against an SVG that needs checking."""
+    img = Image.fromarray(rgb)
+    img.thumbnail((1200, 1200))
     buf = io.BytesIO()
-    crop.save(buf, "PNG")
+    img.save(buf, "PNG")
     return buf.getvalue()
 
 
@@ -693,8 +371,7 @@ def find_pdfs(in_dir: Path, out_dir: Path) -> list[Path]:
 
 
 def write_outputs(results: list[PageResult], out_dir: Path) -> list[dict]:
-    """Name and save every SVG in input order; return the report rows."""
-    review_dir = out_dir / REVIEW_DIR
+    """Save every SVG, named after its PDF, in input order; return the report rows."""
     taken: set[str] = set()
     review_taken: set[str] = set()
     rows = []
@@ -703,29 +380,21 @@ def write_outputs(results: list[PageResult], out_dir: Path) -> list[dict]:
         by_pdf.setdefault(r.source, []).append(r)
     for source, pages in by_pdf.items():
         traced = [p for p in pages if p.svg is not None]
-        for page in traced:
-            page.stem = page.name or Path(source).stem
-        for page in traced:
-            same = [p for p in traced if p.stem == page.stem]
-            stem = f"{page.stem} - {same.index(page) + 1}" if len(same) > 1 else page.stem
-            folder, used = (out_dir, taken) if page.status == "ok" else (review_dir, review_taken)
+        for n, page in enumerate(traced, start=1):
+            stem = Path(source).stem + (f" - {n}" if len(traced) > 1 else "")
+            folder, used = (out_dir, taken) if page.status == "ok" else (out_dir / REVIEW_DIR, review_taken)
             folder.mkdir(parents=True, exist_ok=True)
             path = unique_path(folder, stem, ".svg", used)
-            if path.stem != stem and folder == out_dir:
-                page.reason += "; another dog has this name, so it was numbered"
             path.write_text(page.svg, encoding="utf-8")
             page.svg = str(path.relative_to(out_dir))
-            if page.status == "review" and page.preview_png:
-                (folder / f"{path.stem}-label.png").write_bytes(page.preview_png)
+            if page.preview_png:
+                (folder / f"{path.stem}-page.png").write_bytes(page.preview_png)
         for page in pages:
             rows.append({
                 "source_pdf": page.source,
                 "page": page.page,
                 "status": {"ok": "converted", "review": "needs review"}.get(page.status, page.status),
                 "output_svg": page.svg or "",
-                "dog_name": page.name or "",
-                "confidence": "" if page.confidence is None else f"{page.confidence:.2f}",
-                "text_from": page.text_source,
                 "note": page.reason,
             })
     return rows
@@ -733,7 +402,7 @@ def write_outputs(results: list[PageResult], out_dir: Path) -> list[dict]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Convert a folder of paw-print PDF scans into transparent SVGs named after each dog.",
+        description="Convert a folder of paw-print PDF scans into grayscale SVGs with transparent backgrounds.",
     )
     parser.add_argument("folder", type=Path, help="folder of PDF scans (subfolders are included)")
     parser.add_argument("--out", type=Path, help="output folder (default: '<folder>-svg' next to the input)")
@@ -741,15 +410,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dpi", type=int, default=300, help="scan resolution to work at (default: 300)")
     parser.add_argument("--workers", type=int, default=min(os.cpu_count() or 2, 8),
                         help="PDFs to process at once (default: one per CPU core, up to 8)")
-    parser.add_argument("--ocr", choices=["auto", "vision", "tesseract", "none"], default="auto",
-                        help="text reader for labels (default: Apple Vision on a Mac)")
     parser.add_argument("--threshold", type=float,
                         help="how much darker than the paper a pixel must be to count as ink (0-255, default: 25)")
-    parser.add_argument("--min-confidence", type=float, default=0.5,
-                        help="flag names read with lower OCR confidence (0-1, default: 0.5)")
-    parser.add_argument("--name-pattern",
-                        help="regex that finds the name on each label, e.g. 'Pet: (?P<name>.+)'")
-    parser.add_argument("--dry-run", action="store_true", help="only show the names it would use; write nothing")
     parser.add_argument("--open", action="store_true", help="open the output folder in Finder when done (macOS)")
     args = parser.parse_args(argv)
 
@@ -757,19 +419,13 @@ def main(argv: list[str] | None = None) -> int:
     if not in_dir.is_dir():
         parser.error(f"{in_dir} is not a folder")
     out_dir = (args.out.expanduser().resolve() if args.out else default_out_dir(in_dir))
-    if args.name_pattern:
-        re.compile(args.name_pattern)
-    opts = Options(args.dpi, args.detail, args.ocr, args.threshold, args.min_confidence, args.name_pattern, args.dry_run)
+    opts = Options(args.dpi, args.detail, args.threshold)
     pdfs = find_pdfs(in_dir, out_dir)
+    print(f"Paw Prints converter, version {VERSION}")
     if not pdfs:
         print(f"No PDF files found in {in_dir}")
         return 1
-    backend = pick_ocr_backend(opts.ocr)
-    if backend == "none":
-        print("Warning: no OCR available, so only searchable PDFs will get names. "
-              "On a Mac run setup.sh; elsewhere install Tesseract.")
-    print(f"Converting {len(pdfs)} PDF(s) from {in_dir}")
-    print(f"Label reader: {backend} · detail: {opts.detail} · workers: {args.workers}")
+    print(f"Converting {len(pdfs)} PDF(s) from {in_dir} · detail: {opts.detail} · workers: {args.workers}")
 
     start = time.monotonic()
     results: dict[str, list[PageResult]] = {}
@@ -780,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
                 pages = future.result()
                 results[pages[0].source] = pages
                 icons = {"ok": "✓", "review": "⚑", "skipped": "·", "error": "✗"}
-                summary = ", ".join(f"{icons[p.status]} {p.name or p.reason}" for p in pages)
+                summary = ", ".join(f"{icons[p.status]} {p.reason or 'done'}" for p in pages)
                 print(f"[{done}/{len(pdfs)}] {pages[0].source}: {summary}", flush=True)
     except BrokenProcessPool:
         # A worker died outright (a crash inside a library). Keep everything already finished.
@@ -791,9 +447,6 @@ def main(argv: list[str] | None = None) -> int:
         results.setdefault(source, [PageResult(source, 1, 1, "error", reason="converter crashed; not converted")])
     ordered = [page for source in sources for page in results[source]]
 
-    if opts.dry_run:
-        print(f"\nDry run finished in {time.monotonic() - start:.0f}s; nothing was written.")
-        return 0
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = write_outputs(ordered, out_dir)
     with open(out_dir / REPORT_NAME, "w", newline="", encoding="utf-8") as fh:
@@ -806,7 +459,7 @@ def main(argv: list[str] | None = None) -> int:
           f"{count['skipped']} skipped · {count['error']} errors · {time.monotonic() - start:.0f}s")
     print(f"Output: {out_dir}")
     if count["needs review"]:
-        print(f"Check {out_dir / REVIEW_DIR}: each SVG is ready, it just needs the dog's name as its file name.")
+        print(f"Check {out_dir / REVIEW_DIR}: compare each SVG with its -page.png and erase anything that isn't paw.")
     if args.open and sys.platform == "darwin":
         subprocess.run(["open", str(out_dir)], check=False)
     return 0 if not count["error"] else 2
