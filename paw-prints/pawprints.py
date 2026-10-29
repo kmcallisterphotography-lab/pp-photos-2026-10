@@ -4,8 +4,8 @@
 Each PDF is already named after the patient (e.g. "Brown.pdf"). For every page the script:
 
   1. renders the page and finds the ink: anything darker than the paper around it,
-  2. keeps only the paw: drops colored marks, thin lines, writing, and anything that
-     isn't a main pad or a toe pad near it,
+  2. keeps only the paw: drops colored marks, thin lines, writing, and anything outside
+     the outline of the main pad and its toe pads (pages with no paw are skipped),
   3. removes the paper so only the paw is left, in grayscale,
   4. traces it with vtracer and saves "<PDF name>.svg" ("<PDF name> - 2.svg" for a second page).
 
@@ -35,19 +35,20 @@ from pathlib import Path
 import numpy as np
 import pymupdf
 import vtracer
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw
 from scipy import ndimage
+from scipy.spatial import ConvexHull
 
-VERSION = "2026-10-29"
+VERSION = "2026-10-29b"
 REVIEW_DIR = "NEEDS_REVIEW"
 REPORT_NAME = "report.csv"
-NO_CLEAR_PAW = "couldn't find a clear paw shape; check that only the paw was kept"
 
-# vtracer settings. Higher detail keeps more of the ink texture and makes bigger files.
+# Tracing settings. Tracing at 2x the scan resolution keeps fine skin texture and fur strokes
+# crisp; higher detail also keeps more shades of gray and makes bigger files.
 DETAIL_PRESETS = {
-    "low": dict(filter_speckle=8, color_precision=5, layer_difference=32),
-    "medium": dict(filter_speckle=4, color_precision=6, layer_difference=16),
-    "high": dict(filter_speckle=2, color_precision=7, layer_difference=8),
+    "low": dict(scale=1, filter_speckle=2, color_precision=7, layer_difference=8),
+    "medium": dict(scale=2, filter_speckle=4, color_precision=7, layer_difference=10),
+    "high": dict(scale=2, filter_speckle=2, color_precision=8, layer_difference=4),
 }
 
 
@@ -70,12 +71,6 @@ class PageResult:
 
 
 # ---------------------------------------------------------------- finding the ink
-
-
-def color_distance2(rgb: np.ndarray, paper: np.ndarray) -> np.ndarray:
-    """Squared color distance of every pixel from the paper (lookup tables keep big scans fast)."""
-    lut = ((np.arange(256)[None, :] - paper[:, None]) ** 2).astype(np.int32)
-    return lut[0][rgb[..., 0]] + lut[1][rgb[..., 1]] + lut[2][rgb[..., 2]]
 
 
 def luminance(rgb: np.ndarray) -> np.ndarray:
@@ -137,22 +132,16 @@ def drop_colored_marks(ink: np.ndarray, rgb: np.ndarray) -> np.ndarray:
     return ink & (chroma <= 50)
 
 
-def paw_region(ink: np.ndarray, dpi: int, close_mm: float, density: float) -> tuple[np.ndarray, bool]:
-    """(region to keep, whether a paw was found).
-
-    Found: the region covers each main pad and the toe pads near it. Not found: it covers every
-    solid shape on the page, which still leaves out lines and writing.
-    """
+def paw_region(ink: np.ndarray, dpi: int, close_mm: float, density: float) -> np.ndarray | None:
+    """Region covering each main pad and the toe pads near it, or None if nothing looks like a paw."""
     h, w = ink.shape
     f = max(1, round(dpi / 100))  # work at ~100 DPI; plenty for finding shapes
     hh, ww = math.ceil(h / f), math.ceil(w / f)
     padded = np.zeros((hh * f, ww * f), bool)
     padded[:h, :w] = ink
-    coarse = padded.reshape(hh, f, ww, f).mean(axis=(1, 3)) >= density
+    fraction = padded.reshape(hh, f, ww, f).mean(axis=(1, 3))
+    coarse = fraction >= density
     mm = dpi / f / 25.4  # coarse pixels per mm
-
-    def full_size(region: np.ndarray) -> np.ndarray:
-        return np.repeat(np.repeat(grow(region, 1.5 * mm), f, axis=0), f, axis=1)[:h, :w]
 
     # Fill the skin texture so each pad is one solid shape, then drop everything thinner than
     # 2.5 mm: pen lines, drawn heart outlines, card edges.
@@ -160,10 +149,12 @@ def paw_region(ink: np.ndarray, dpi: int, close_mm: float, density: float) -> tu
     solid = grow(shrink(solid, 1.25 * mm), 1.25 * mm)
     cores, count = ndimage.label(solid)
     areas = np.bincount(cores.ravel(), minlength=count + 1)
-    # Pads have truly solid ink somewhere (2 mm across); printed letters are ~1 mm strokes, so a
-    # word that the filling-in turned into a block doesn't.
-    has_solid_ink = np.zeros(count + 1, bool)
-    has_solid_ink[np.unique(cores[shrink(coarse, 1.0 * mm)])] = True
+    # Pads are partly truly solid ink (spots 2 mm across): 13-90% of a pad on real scans. Printed
+    # letters are thin strokes, so a block of label text that the filling-in turned into a shape
+    # is ~0% solid.
+    solid_ink = shrink(fraction >= 0.5, 1.0 * mm)
+    solid_share = ndimage.sum(solid_ink, cores, index=np.arange(count + 1)) / np.maximum(areas, 1)
+    has_solid_ink = solid_share >= 0.05
     blobs = []  # roundish solid shapes, like pads: not bars, frames, cards, stickers or words
     for idx, (ys, xs) in enumerate(ndimage.find_objects(cores), start=1):
         bh, bw = ys.stop - ys.start, xs.stop - xs.start
@@ -172,72 +163,68 @@ def paw_region(ink: np.ndarray, dpi: int, close_mm: float, density: float) -> tu
                 and has_solid_ink[idx]):
             blobs.append(idx)
     if not blobs:
-        return full_size(solid), False
+        return None
     largest = max(areas[i] for i in blobs)
-    keep = np.zeros(count + 1, bool)
+    region = Image.new("1", (ww, hh), 0)
     for pad in [i for i in blobs if areas[i] >= 0.35 * largest]:  # main pads (two if two paws)
-        keep[pad] = True
         # Toe pads sit within about 3/4 of a pad-width of the main pad; hearts and marks further out go.
         reach = 0.75 * 2 * math.sqrt(areas[pad] / math.pi)
         dist = ndimage.distance_transform_edt(cores != pad)
-        for idx, nearest in zip(blobs, ndimage.minimum(dist, labels=cores, index=blobs)):
-            keep[idx] |= nearest <= reach
-    return full_size(keep[cores]), True
+        paw = [i for i, nearest in zip(blobs, ndimage.minimum(dist, labels=cores, index=blobs)) if nearest <= reach]
+        # Keep everything inside the outline wrapped around the pad and its toes, so fur streaks
+        # and texture between the pads stay.
+        ys, xs = np.nonzero(np.isin(cores, paw))
+        points = np.column_stack([xs, ys])
+        if len(points) >= 3:
+            hull = points[ConvexHull(points).vertices]
+            ImageDraw.Draw(region).polygon([tuple(p) for p in hull.tolist()], fill=1)
+    region = grow(np.asarray(region, bool), 1.5 * mm)
+    return np.repeat(np.repeat(region, f, axis=0), f, axis=1)[:h, :w]
 
 
-def isolate_paw(ink: np.ndarray, rgb: np.ndarray, dpi: int) -> tuple[np.ndarray, str, str]:
-    """(mask of just the paw, reason there is no paw, warning that needs a person to check)."""
+def isolate_paw(ink: np.ndarray, rgb: np.ndarray, dpi: int) -> tuple[np.ndarray, str]:
+    """(mask of just the paw, reason there is no paw)."""
     if not ink.any():
-        return ink, "no paw found (page is blank)", ""
+        return ink, "no paw found (page is blank)"
     ink = drop_colored_marks(ink, rgb)
     # A faint, patchy print needs more filling-in before its pads look solid.
     for close_mm, density in ((1.0, 0.35), (2.5, 0.2)):
-        region, found = paw_region(ink, dpi, close_mm, density)
-        if found:
+        region = paw_region(ink, dpi, close_mm, density)
+        if region is not None:
             break
-    if found or region.any():
-        ink = ink & region
+    else:
+        return ink, "no paw found (nothing paw-shaped on the page)"
+    ink = ink & region
     if ink.sum() < 50 * (dpi / 25.4) ** 2:  # under ~50 mm² of ink
-        return ink, "no paw found (only small marks on the page)", ""
-    return ink, "", "" if found else NO_CLEAR_PAW
+        return ink, "no paw found (only small marks on the page)"
+    return ink, ""
 
 
-def paw_rgba(rgb: np.ndarray, mask: np.ndarray, ink: np.ndarray, dpi: int) -> np.ndarray:
-    """Crop to the paw, make everything that is not ink fully transparent, and go grayscale."""
+def paw_rgba(rgb: np.ndarray, mask: np.ndarray, dpi: int) -> tuple[np.ndarray, np.ndarray]:
+    """(grayscale crop around the paw, which of its pixels are paw), with a transparent margin."""
     ys, xs = np.nonzero(mask)
     margin = round(2 / 25.4 * dpi)
     y0, y1 = max(0, ys.min() - margin), min(rgb.shape[0], ys.max() + margin + 1)
     x0, x1 = max(0, xs.min() - margin), min(rgb.shape[1], xs.max() + margin + 1)
-    crop = np.array(Image.fromarray(rgb[y0:y1, x0:x1]).filter(ImageFilter.MedianFilter(3)))
-    bare = ~ink[y0:y1, x0:x1]
-    paper = np.median(crop[bare], axis=0) if bare.any() else np.full(3, 255.0)  # paper right here
-    dist2 = color_distance2(crop, paper)
-    keep = mask[y0:y1, x0:x1]
-    # Pixels that are mostly paper (under 30% of the ink's strength) become transparent too,
-    # so the paw has no pale fringe and its skin-texture gaps show through.
-    strong = np.percentile(dist2[keep], 90)
-    keep &= dist2 >= 0.09 * strong
-    # Edge pixels are part paper, so they scan paler than the ink. Give them the color of the
-    # nearest solid ink so no light outline shows when the SVG sits on a dark background.
-    solid = keep & (dist2 >= 0.8 * strong)
-    if solid.any():
-        edge = keep & ~ndimage.binary_erosion(keep, iterations=max(1, round(0.6 / 25.4 * dpi)))
-        iy, ix = ndimage.distance_transform_edt(~solid, return_distances=False, return_indices=True)
-        paler = edge & (dist2 < dist2[iy, ix])
-        crop[paler] = crop[iy[paler], ix[paler]]
-    gray = (crop.astype(np.uint32) @ np.array([299, 587, 114], np.uint32) // 1000).astype(np.uint8)
-    rgba = np.dstack([gray, gray, gray, np.where(keep, 255, 0).astype(np.uint8)])
-    rgba[~keep, :3] = 255
-    # A fully transparent frame makes vtracer key out the background (it samples the edges).
-    return np.pad(rgba, ((margin, margin), (margin, margin), (0, 0)), constant_values=0)
+    gray = luminance(rgb[y0:y1, x0:x1])
+    # A margin of nothing around the paw makes vtracer key out the background (it samples the edges).
+    pad = ((margin, margin), (margin, margin))
+    return np.pad(gray, pad, constant_values=255), np.pad(mask[y0:y1, x0:x1], pad)
 
 
 # ---------------------------------------------------------------- tracing
 
 
-def trace_svg(rgba: np.ndarray, dpi: int, detail: str) -> str:
-    h, w, _ = rgba.shape
+def trace_svg(gray: np.ndarray, keep: np.ndarray, dpi: int, detail: str) -> str:
     preset = DETAIL_PRESETS[detail]
+    scale = preset["scale"]
+    if scale > 1:  # smooth enlargement, so curves follow the texture instead of the pixel grid
+        size = (gray.shape[1] * scale, gray.shape[0] * scale)
+        gray = np.asarray(Image.fromarray(gray).resize(size, Image.BICUBIC))
+        keep = np.asarray(Image.fromarray(keep.astype(np.uint8) * 255).resize(size, Image.BILINEAR)) >= 128
+    h, w = gray.shape
+    rgba = np.dstack([gray, gray, gray, np.where(keep, 255, 0).astype(np.uint8)])
+    rgba[~keep, :3] = 255
     png = io.BytesIO()
     Image.fromarray(rgba, "RGBA").save(png, "PNG", compress_level=1)
     svg = vtracer.convert_raw_image_to_svg(
@@ -257,7 +244,7 @@ def trace_svg(rgba: np.ndarray, dpi: int, detail: str) -> str:
         2,  # path_precision
     )
     # Real-world size, so the paw imports into Illustrator/Cricut at its true scale.
-    mm_w, mm_h = w / dpi * 25.4, h / dpi * 25.4
+    mm_w, mm_h = w / (dpi * scale) * 25.4, h / (dpi * scale) * 25.4
     return re.sub(
         r'<svg ([^>]*?)width="\d+" height="\d+"',
         rf'<svg \1width="{mm_w:.2f}mm" height="{mm_h:.2f}mm" viewBox="0 0 {w} {h}"',
@@ -319,16 +306,15 @@ def convert_page(page: pymupdf.Page, opts: Options, result: PageResult) -> None:
     pix = page.get_pixmap(dpi=opts.dpi, colorspace=pymupdf.csRGB, alpha=False)
     rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3)
     ink = ink_mask(rgb, opts.threshold, opts.dpi)
-    mask, no_paw, warning = isolate_paw(ink, rgb, opts.dpi)
+    mask, no_paw = isolate_paw(ink, rgb, opts.dpi)
     if no_paw:
         result.status, result.reason = "skipped", no_paw
         return
-    svg = trace_svg(paw_rgba(rgb, mask, ink, opts.dpi), opts.dpi, opts.detail)
+    svg = trace_svg(*paw_rgba(rgb, mask, opts.dpi), opts.dpi, opts.detail)
     problem = background_problem(svg)
+    result.status, result.svg = ("review" if problem else "ok"), svg
     if problem:
-        warning = f"possible background left in SVG: {problem}"
-    result.status, result.reason, result.svg = ("review" if warning else "ok"), warning, svg
-    if warning:
+        result.reason = f"possible background left in SVG: {problem}"
         result.preview_png = page_preview(rgb)
 
 

@@ -67,7 +67,7 @@ def test_svgs_are_grayscale_paws_on_transparent_background(batch):
         gray = 0.299 * ink[0] + 0.587 * ink[1] + 0.114 * ink[2]
         if name != "Brownie Cole.svg":  # the faint print is lighter than its ink
             assert abs(np.median(opaque) - gray) < 30, f"{name}: ink shade changed"
-        assert (opaque.min(axis=1) > 200).mean() < 0.01, f"{name}: white or pale fill left in the SVG"
+        assert (opaque.min(axis=1) > 240).mean() < 0.01, f"{name}: paper-white fill left in the SVG"
         # The paw is 76 mm across (82 mm with margins). A label, heart, line or card left in the
         # SVG would make it bigger.
         root = pp.ET.fromstring(text)
@@ -116,8 +116,21 @@ def test_lines_alone_are_not_a_paw():
     ink = np.zeros((1000, 1000), bool)
     ink[500:506, 100:900] = True  # a 0.5 mm pen line
     ink[100:900, 200:206] = True
-    region, found = pp.paw_region(ink, 300, 1.0, 0.35)
-    assert not found and not region.any()
+    assert pp.paw_region(ink, 300, 1.0, 0.35) is None
+    assert pp.paw_region(ink, 300, 2.5, 0.2) is None
+
+
+def test_label_text_block_is_not_a_paw():
+    # Three lines of bold label text, like a pharmacy sticker: they fill in to a solid block, but
+    # unlike a pad there is no solid ink in it.
+    ink = np.zeros((600, 900), bool)
+    for top in (100, 160, 220):
+        for left in range(100, 700, 22):
+            ink[top:top + 36, left:left + 6] = True  # letter stems, ~0.5 mm strokes
+            ink[top:top + 6, left:left + 16] = True
+            ink[top + 30:top + 36, left:left + 16] = True
+    assert pp.paw_region(ink, 300, 1.0, 0.35) is None
+    assert pp.paw_region(ink, 300, 2.5, 0.2) is None
 
 
 def test_background_check_catches_full_canvas_shape():

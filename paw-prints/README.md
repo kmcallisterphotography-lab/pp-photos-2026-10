@@ -48,25 +48,25 @@ is ever overwritten. Your PDFs are never changed.
 
 ```
 paw-scans-svg/
+  Bandit Oswalt K9.svg     ← the label side of the card has no paw, so it's skipped
   Brown.svg
-  Buddy Smith.svg
-  Daisy O'Brien - 1.svg    ← a PDF with two pages gives one SVG per page
+  Daisy O'Brien - 1.svg    ← a PDF with a paw on each of two pages gives one SVG per paw
   Daisy O'Brien - 2.svg
   NEEDS_REVIEW/
     Coco.svg               ← finished, but worth a look
     Coco-page.png          ← the original page, to compare against
-  report.csv               ← one line per page, with any problem noted
+  report.csv               ← one line per page, including skipped ones and why
 ```
 
 The terminal also shows the converter's version when it starts. If a fix doesn't seem to
 take, check that line.
 
-**What to do with NEEDS_REVIEW:** compare the SVG with its `-page.png` and erase anything
-that isn't paw. A file lands here when:
+**What to do with NEEDS_REVIEW:** compare the SVG with its `-page.png` and fix anything
+that's off. A file lands here when the SVG seems to contain a leftover background.
 
-- the print is too faint or broken up to pick out the paw's shape, so every solid mark on
-  the sheet was kept;
-- the SVG seems to contain a leftover background.
+**Pages with no paw** are skipped, such as the label side of a card or a blank page.
+`report.csv` lists them. If a real paw page is ever skipped, its print was too faint to
+find. Try `--threshold 15`.
 
 ## What it does to each scan
 
@@ -76,14 +76,14 @@ that isn't paw. A file lands here when:
    - red or other colored marks, such as hearts, when the paw is in black ink;
    - anything thinner than about 2.5 mm, such as pen lines, card edges, heart outlines and
      writing;
-   - anything that isn't the main pad or one of the toe pads close to it, such as the label
-     or stamped hearts elsewhere on the sheet.
-3. Removes the paper. Anything close to the paper color becomes transparent, including
-   the little gaps in the paw's skin texture. Edges are cleaned up so there's no white
-   halo when the paw sits on a dark background.
-4. Traces the paw in **grayscale** and saves the SVG at its **true physical size** (in mm),
-   so it imports into Illustrator, Cricut Design Space, and similar tools at the right
-   scale.
+   - anything outside the outline around the main pad and its toe pads, such as the label
+     or stamped hearts elsewhere on the sheet. Inside that outline everything stays, such as
+     the fur streaks between the pads.
+3. Removes the paper. Paper and the little gaps in the paw's skin texture become
+   transparent. All the ink keeps its shade of gray, light skin texture included.
+4. Traces the paw in **grayscale** at twice the scan's resolution, so fine texture and fur
+   strokes stay crisp. The SVG is saved at its **true physical size** (in mm), so it imports
+   into Illustrator, Cricut Design Space, and similar tools at the right scale.
 
 ## Options
 
@@ -95,7 +95,7 @@ To use options, run the script in Terminal from this folder:
 
 | Option | What it does |
 |---|---|
-| `--detail low/medium/high` | How much ink texture and shading to keep. `high` keeps the most texture and makes bigger files. Default is `medium`. |
+| `--detail low/medium/high` | How much ink texture and shading to keep. `medium` (default) traces at double resolution, about 5–7 MB per paw. `high` keeps even more shades of gray, about 8 MB. `low` makes smaller files, about 2 MB, but the fine texture gets softer. |
 | `--out FOLDER` | Put the results somewhere else. |
 | `--threshold 25` | How much darker than the paper around it a spot must be to count as ink (0–255). Lower it if faint ink is lost; raise it if paper smudges or card edges show up. Default is 25. |
 | `--workers N` | How many PDFs to process at once. Defaults to one per CPU core, up to 8. |
@@ -103,8 +103,10 @@ To use options, run the script in Terminal from this folder:
 
 ## Good to know
 
-- **Speed:** each PDF takes 1–2 seconds of work, and several run at once (one per CPU
-  core), so around 100 scans should take under a minute on a recent Mac.
+- **Speed:** each paw takes about 5 seconds of work, and several run at once (one per CPU
+  core), so around 100 scans take a minute or two on a recent Mac.
+- **Light prints on dark products:** the SVG keeps the print's real shades. On a dark
+  background, the light-gray parts of a light print will show as light gray.
 - **Scanning tips:** 300 DPI color scans on plain white paper work best. Keep the label,
   and any hearts or drawings, a little away from the paw, about an inch. A solid black mark
   touching the paw or sitting right between the toes can't be told apart from the paw, so it
