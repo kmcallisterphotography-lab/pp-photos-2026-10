@@ -39,7 +39,7 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 from scipy.spatial import ConvexHull
 
-VERSION = "2026-10-29b"
+VERSION = "2026-10-29c"
 REVIEW_DIR = "NEEDS_REVIEW"
 REPORT_NAME = "report.csv"
 
@@ -386,6 +386,22 @@ def write_outputs(results: list[PageResult], out_dir: Path) -> list[dict]:
     return rows
 
 
+def describe(pages: list[PageResult]) -> str:
+    """One progress line for a PDF, e.g. "✓ paw saved (page 2) · page 1: no paw, skipped"."""
+    paws = [p for p in pages if p.status in ("ok", "review")]
+    if paws:
+        where = ", ".join(str(p.page) for p in paws)
+        parts = [f"✓ paw saved (page {where})" if len(paws) == 1 else f"✓ {len(paws)} paws saved (pages {where})"]
+        parts += [f"⚑ page {p.page} needs a look: {p.reason}" for p in paws if p.status == "review"]
+        skipped = [str(p.page) for p in pages if p.status == "skipped"]
+        if skipped:
+            parts.append(f"page {', '.join(skipped)}: no paw, skipped")
+    else:
+        parts = ["✗ NO PAW FOUND on any page"] if all(p.status == "skipped" for p in pages) else []
+    parts += [f"✗ page {p.page} error: {p.reason}" for p in pages if p.status == "error"]
+    return " · ".join(parts)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Convert a folder of paw-print PDF scans into grayscale SVGs with transparent backgrounds.",
@@ -421,9 +437,7 @@ def main(argv: list[str] | None = None) -> int:
             for done, future in enumerate(as_completed(futures), start=1):
                 pages = future.result()
                 results[pages[0].source] = pages
-                icons = {"ok": "✓", "review": "⚑", "skipped": "·", "error": "✗"}
-                summary = ", ".join(f"{icons[p.status]} {p.reason or 'done'}" for p in pages)
-                print(f"[{done}/{len(pdfs)}] {pages[0].source}: {summary}", flush=True)
+                print(f"[{done}/{len(pdfs)}] {pages[0].source}: {describe(pages)}", flush=True)
     except BrokenProcessPool:
         # A worker died outright (a crash inside a library). Keep everything already finished.
         print("\nThe converter crashed partway through. Finished files are saved below; "
@@ -441,11 +455,15 @@ def main(argv: list[str] | None = None) -> int:
         writer.writerows(rows)
 
     count = {s: sum(r["status"] == s for r in rows) for s in ("converted", "needs review", "skipped", "error")}
-    print(f"\n{count['converted']} converted · {count['needs review']} need review · "
-          f"{count['skipped']} skipped · {count['error']} errors · {time.monotonic() - start:.0f}s")
+    no_paw = [s for s in sources if not any(p.status in ("ok", "review") for p in results[s])]
+    print(f"\n{count['converted'] + count['needs review']} paw SVGs saved from {len(pdfs)} PDFs "
+          f"({count['needs review']} to check) · {count['skipped']} pages without a paw skipped "
+          f"· {count['error']} errors · {time.monotonic() - start:.0f}s")
     print(f"Output: {out_dir}")
     if count["needs review"]:
         print(f"Check {out_dir / REVIEW_DIR}: compare each SVG with its -page.png and erase anything that isn't paw.")
+    if no_paw:
+        print(f"No paw found in {len(no_paw)} PDF(s): " + ", ".join(no_paw))
     if args.open and sys.platform == "darwin":
         subprocess.run(["open", str(out_dir)], check=False)
     return 0 if not count["error"] else 2
