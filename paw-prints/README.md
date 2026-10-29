@@ -66,7 +66,10 @@ the dog's name. The SVG is already done. A file lands here when:
 
 - there's no label, or the label has no readable name;
 - two different lines look equally like the name (for example "Bella" and "Coco" in the same size);
-- OCR wasn't confident about what it read.
+- OCR wasn't confident about what it read;
+- the print is too faint or broken up to pick out the paw's shape, so everything on the
+  sheet was kept. Check it and erase any extras. If a name was read, the file already has
+  it.
 
 ## What it does to each scan
 
@@ -76,13 +79,18 @@ the dog's name. The SVG is already done. A file lands here when:
 2. Picks the name. A `Name: ...` field wins. Otherwise it takes the largest line that looks
    like a name. Lines like `Owner: ...`, dates, and "left front" are ignored. ALL-CAPS names
    are changed to normal capitalization (`BUDDY SMITH` → `Buddy Smith`).
-3. Removes the label and any dust specks, so only the paw is left.
+3. Keeps only the paw. It removes:
+   - the label;
+   - red or other colored marks, such as hearts, when the paw is in black ink;
+   - anything thinner than about 2.5 mm, such as pen lines, heart outlines and writing;
+   - anything that isn't the main pad or one of the toe pads close to it, such as stamped
+     hearts elsewhere on the sheet.
 4. Removes the paper. Anything close to the paper color becomes transparent, including
    the little gaps in the paw's skin texture. Edges are cleaned up so there's no white
    halo when the paw sits on a dark background.
-5. Traces the paw in its real ink colors and saves the SVG at its **true physical size**
-   (in mm), so it imports into Illustrator, Cricut Design Space, and similar tools at the
-   right scale.
+5. Traces the paw in **grayscale** and saves the SVG at its **true physical size** (in mm),
+   so it imports into Illustrator, Cricut Design Space, and similar tools at the right
+   scale.
 
 ## Options
 
@@ -95,7 +103,7 @@ To use options, run the script in Terminal from this folder:
 | Option | What it does |
 |---|---|
 | `--dry-run` | List the name it would use for each PDF without writing anything. Good for a quick check. |
-| `--detail low/medium/high` | How much ink texture to keep. `high` keeps the most texture and makes bigger files. Default is `medium`. |
+| `--detail low/medium/high` | How much ink texture and shading to keep. `high` keeps the most texture and makes bigger files. Default is `medium`. |
 | `--out FOLDER` | Put the results somewhere else. |
 | `--name-pattern REGEX` | Tell it exactly where the name is, if your labels have a fixed layout. Example: `--name-pattern 'Pet: (?P<name>.+)'` |
 | `--min-confidence 0.5` | Flag names read with OCR confidence below this (0–1). |
@@ -107,8 +115,10 @@ To use options, run the script in Terminal from this folder:
 
 - **Speed:** each PDF takes 1–2 seconds of work, and several run at once (one per CPU
   core), so around 100 scans should take under a minute on a recent Mac.
-- **Scanning tips:** 300 DPI color scans on plain white paper work best. Keep the label a
-  little away from the paw, about half an inch.
+- **Scanning tips:** 300 DPI color scans on plain white paper work best. Keep the label,
+  and any hearts or drawings, a little away from the paw, about an inch. A solid black mark
+  touching the paw or sitting right between the toes can't be told apart from the paw, so it
+  stays in.
 - **Not on a Mac?** The script also runs on Windows or Linux with
   [Tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html) installed for
   reading labels. Labels on a big colored sticker aren't removed automatically yet.
@@ -124,7 +134,7 @@ The tests generate fake scans (`tests/make_samples.py`) and check the following:
 
 - file names and which files get flagged
 - `report.csv` contents
-- each SVG has a transparent background and keeps the ink color
-- the label is removed
+- each SVG is grayscale on a transparent background
+- the label, hearts, pen lines and marker strokes are removed, leaving only the paw
 - no pale fringe is left around the paw
 - re-running never overwrites earlier results

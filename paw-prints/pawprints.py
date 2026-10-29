@@ -358,13 +358,71 @@ def is_printed_text(line: TextLine, ink: np.ndarray) -> bool:
     return ndimage.distance_transform_edt(closed).max() <= 0.2 * line.height
 
 
-def isolate_paw(ink: np.ndarray, lines: list[TextLine], dpi: int) -> tuple[np.ndarray, str]:
-    """Mask of just the paw: the label and stray dust removed. Reason is set if there is no paw."""
+def grow(mask: np.ndarray, radius: float) -> np.ndarray:
+    """Dilate by a disk (via a distance transform, much faster than a big structuring element)."""
+    if not mask.any():
+        return mask.copy()  # the transform needs at least one set pixel to measure from
+    return ndimage.distance_transform_edt(~mask) <= radius
+
+
+def shrink(mask: np.ndarray, radius: float) -> np.ndarray:
+    """Erode by a disk."""
+    return ndimage.distance_transform_edt(np.pad(mask, 1))[1:-1, 1:-1] > radius
+
+
+def drop_colored_marks(ink: np.ndarray, rgb: np.ndarray) -> np.ndarray:
+    """Remove red or other colored marks (hearts, stickers) when the paw is printed in black/gray ink."""
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    chroma = np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)
+    if not ink.any() or np.median(chroma[ink]) > 50:
+        return ink  # the paw itself is in colored ink, so color can't tell it apart
+    return ink & (chroma <= 50)
+
+
+def paw_region(ink: np.ndarray, dpi: int) -> np.ndarray | None:
+    """Where the paw is: each main pad plus the toe pads around it. None if no paw-like shape."""
+    h, w = ink.shape
+    f = max(1, round(dpi / 100))  # work at ~100 DPI; plenty for finding shapes
+    hh, ww = math.ceil(h / f), math.ceil(w / f)
+    padded = np.zeros((hh * f, ww * f), bool)
+    padded[:h, :w] = ink
+    coarse = padded.reshape(hh, f, ww, f).mean(axis=(1, 3)) >= 0.35
+    mm = dpi / f / 25.4  # coarse pixels per mm
+    # Fill the skin texture so each pad is one solid shape, then drop everything thinner than
+    # 2.5 mm: pen lines, drawn heart outlines, handwriting.
+    solid = shrink(grow(coarse, 1.0 * mm), 1.0 * mm)
+    solid = grow(shrink(solid, 1.25 * mm), 1.25 * mm)
+    cores, count = ndimage.label(solid)
+    if count == 0:
+        return None
+    areas = np.bincount(cores.ravel(), minlength=count + 1)
+    blobs = []  # roundish solid shapes, like pads; not long bars or frames
+    for idx, (ys, xs) in enumerate(ndimage.find_objects(cores), start=1):
+        bh, bw = ys.stop - ys.start, xs.stop - xs.start
+        if areas[idx] / (bh * bw) >= 0.3 and max(bh, bw) <= 3 * min(bh, bw):
+            blobs.append(idx)
+    if not blobs:
+        return None
+    largest = max(areas[i] for i in blobs)
+    keep = np.zeros(count + 1, bool)
+    for pad in [i for i in blobs if areas[i] >= 0.35 * largest]:  # main pads (two if two paws)
+        keep[pad] = True
+        # Toe pads sit within about 3/4 of a pad-width of the main pad; hearts and marks further out go.
+        reach = 0.75 * 2 * math.sqrt(areas[pad] / math.pi)
+        dist = ndimage.distance_transform_edt(cores != pad)
+        for idx, nearest in zip(blobs, ndimage.minimum(dist, labels=cores, index=blobs)):
+            keep[idx] |= nearest <= reach
+    region = grow(keep[cores], 1.5 * mm)
+    return np.repeat(np.repeat(region, f, axis=0), f, axis=1)[:h, :w]
+
+
+def isolate_paw(ink: np.ndarray, rgb: np.ndarray, lines: list[TextLine], dpi: int) -> tuple[np.ndarray, str, str]:
+    """(mask of just the paw, reason there is no paw, warning that needs a person to check)."""
     ink = ink.copy()
     h, w = ink.shape
     labels, count = ndimage.label(ink, structure=np.ones((3, 3), bool))
     if count == 0:
-        return ink, "no paw found (page is blank)"
+        return ink, "no paw found (page is blank)", ""
     areas = np.bincount(labels.ravel(), minlength=count + 1)
     areas[0] = 0
     largest = areas.max()
@@ -397,26 +455,18 @@ def isolate_paw(ink: np.ndarray, lines: list[TextLine], dpi: int) -> tuple[np.nd
                 remove[idx] = True  # a thin frame or sticker edge around the label
         ink[remove[labels]] = False
 
-    # Group nearby ink (pads, toes, texture dots) and keep the big groups: the paw(s).
-    f = max(1, round(dpi / 75))
-    hh, ww = math.ceil(h / f), math.ceil(w / f)
-    padded = np.zeros((hh * f, ww * f), bool)
-    padded[:h, :w] = ink
-    coarse = padded.reshape(hh, f, ww, f).any(axis=(1, 3))
-    reach = max(1, round(5 / 25.4 * dpi / f))  # ink within ~5 mm belongs together
-    groups, group_count = ndimage.label(ndimage.binary_dilation(coarse, iterations=reach))
-    if group_count == 0:
-        return ink, "no paw found (only the label is on the page)"
-    group_of = np.repeat(np.repeat(groups, f, axis=0), f, axis=1)[:h, :w]
-    group_ink = np.bincount(group_of[ink].ravel(), minlength=group_count + 1)
-    group_ink[0] = 0
-    keep = group_ink >= 0.1 * group_ink.max()
-    keep[0] = False
-    ink &= keep[group_of]
+    ink = drop_colored_marks(ink, rgb)
+    region = paw_region(ink, dpi)
+    warning = ""
+    if region is None:
+        # Very faint or broken-up print: keep all the ink and let a person check it.
+        warning = "couldn't find a clear paw shape; check that only the paw was kept"
+    else:
+        ink &= region
 
     if ink.sum() < 50 * (dpi / 25.4) ** 2:  # under ~50 mm² of ink
-        return ink, "no paw found (only small marks on the page)"
-    return ink, ""
+        return ink, "no paw found (only small marks on the page)", ""
+    return ink, "", warning
 
 
 def paw_rgba(rgb: np.ndarray, mask: np.ndarray, paper: np.ndarray, dpi: int) -> np.ndarray:
@@ -440,7 +490,8 @@ def paw_rgba(rgb: np.ndarray, mask: np.ndarray, paper: np.ndarray, dpi: int) -> 
         iy, ix = ndimage.distance_transform_edt(~solid, return_distances=False, return_indices=True)
         paler = edge & (dist2 < dist2[iy, ix])
         crop[paler] = crop[iy[paler], ix[paler]]
-    rgba = np.dstack([crop, np.where(keep, 255, 0).astype(np.uint8)])
+    gray = (crop.astype(np.uint32) @ np.array([299, 587, 114], np.uint32) // 1000).astype(np.uint8)
+    rgba = np.dstack([gray, gray, gray, np.where(keep, 255, 0).astype(np.uint8)])
     rgba[~keep, :3] = 255
     # A fully transparent frame makes vtracer key out the background (it samples the edges).
     return np.pad(rgba, ((margin, margin), (margin, margin), (0, 0)), constant_values=0)
@@ -525,8 +576,10 @@ def process_pdf(pdf_path: str, source: str, opts: Options) -> list[PageResult]:
     # A page with no label of its own (e.g. the second paw) takes the name from the labeled page.
     doc_name = next((r.name for r in results if r.name), None)
     for r in results:
-        if doc_name and r.status == "review" and r.label_missing:
-            r.name, r.status, r.reason = doc_name, "ok", "name from another page of this PDF"
+        if doc_name and r.name is None and r.label_missing and r.status in ("ok", "review"):
+            r.name = doc_name
+            if r.reason.startswith(NO_NAME):  # flagged only because this page had no label
+                r.status, r.reason = "ok", "name from another page of this PDF"
     return results
 
 
@@ -552,20 +605,20 @@ def convert_page(page: pymupdf.Page, opts: Options, backend: str, result: PageRe
     result.name, result.confidence = name, conf
     result.label_missing = name is None and reason.startswith(NO_NAME)
 
-    mask, no_paw = isolate_paw(ink, lines, opts.dpi)
+    mask, no_paw, warning = isolate_paw(ink, rgb, lines, opts.dpi)
     if no_paw:
         result.status, result.reason = "skipped", no_paw
         return
-    result.status, result.reason = ("ok" if name else "review"), reason
-    if name is None:
-        result.preview_png = label_preview(img, lines)
+    result.status = "ok" if name and not warning else "review"
+    result.reason = warning or reason
+    if result.status == "review":
+        result.preview_png = label_preview(img, [] if warning else lines)
     if opts.dry_run:
         return
     svg = trace_svg(paw_rgba(rgb, mask, paper, opts.dpi), opts.dpi, opts.detail)
     problem = background_problem(svg)
     if problem:
         result.status, result.reason = "review", f"possible background left in SVG: {problem}"
-        result.label_missing = False
         result.preview_png = result.preview_png or label_preview(img, lines)
     result.svg = svg
 
@@ -628,7 +681,7 @@ def write_outputs(results: list[PageResult], out_dir: Path) -> list[dict]:
     for source, pages in by_pdf.items():
         traced = [p for p in pages if p.svg is not None]
         for page in traced:
-            page.stem = page.name if page.status == "ok" else Path(source).stem
+            page.stem = page.name or Path(source).stem
         for page in traced:
             same = [p for p in traced if p.stem == page.stem]
             stem = f"{page.stem} - {same.index(page) + 1}" if len(same) > 1 else page.stem

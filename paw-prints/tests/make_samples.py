@@ -18,6 +18,8 @@ PAGE_W, PAGE_H = 612, 792  # US Letter, points
 PAPER = (246, 243, 236)
 NAVY = (38, 34, 70)
 BROWN = (92, 48, 30)
+BLACK = (28, 28, 30)
+RED = (200, 30, 45)
 
 
 def paw_image(ink: tuple[int, int, int], seed: int, size_px: int = 900) -> Image.Image:
@@ -51,6 +53,30 @@ def scan_page(paws: list[tuple[Image.Image, tuple[int, int]]], frame: tuple | No
         page.paste(paw, xy, paw)
     if frame:
         ImageDraw.Draw(page).rectangle(frame, outline=(120, 120, 120), width=4)
+    return page
+
+
+def heart(draw: ImageDraw.ImageDraw, x: int, y: int, size: int, color, width: int | None = None) -> None:
+    """A drawn heart, filled, or as an outline when width is given."""
+    r = size // 4
+    if width:
+        draw.arc((x, y, x + 2 * r, y + 2 * r), 135, 360, fill=color, width=width)
+        draw.arc((x + 2 * r, y, x + 4 * r, y + 2 * r), 180, 45, fill=color, width=width)
+        draw.line([(x + 0.3 * r, y + 1.7 * r), (x + 2 * r, y + size), (x + 3.7 * r, y + 1.7 * r)], fill=color, width=width)
+    else:
+        draw.ellipse((x, y, x + 2 * r, y + 2 * r), fill=color)
+        draw.ellipse((x + 2 * r, y, x + 4 * r, y + 2 * r), fill=color)
+        draw.polygon([(x + 0.1 * r, y + 1.4 * r), (x + 2 * r, y + size), (x + 3.9 * r, y + 1.4 * r)], fill=color)
+
+
+def decorate(page: Image.Image) -> Image.Image:
+    """What staff add to a sheet: hearts, a pen line, a marker stroke."""
+    d = ImageDraw.Draw(page)
+    heart(d, 1750, 1950, 260, RED)  # red heart near the paw
+    heart(d, 250, 250, 300, BLACK, width=7)  # outlined heart
+    heart(d, 2050, 250, 220, BLACK)  # solid black heart, away from the paw
+    d.line([(150, 2300), (2400, 2300)], fill=BLACK, width=5)  # pen line
+    d.line([(250, 1700), (650, 2050)], fill=BLACK, width=18)  # 1.5 mm marker stroke
     return page
 
 
@@ -113,6 +139,10 @@ def make_samples(out: Path) -> dict[str, dict]:
     add_scan(doc, scan_page([(paw_image(BROWN, 6), (820, 500))]), [("Daisy O'Brien", 200, 600, 30)], True, 6)
     add_scan(doc, scan_page([(paw_image(NAVY, 7, 700), (900, 900))]), [], False, 7)
     save("scan_006.pdf", doc, outputs=["Daisy O'Brien - 1.svg", "Daisy O'Brien - 2.svg"], inks=[BROWN, NAVY])
+
+    doc = pymupdf.open()  # black ink plus the hearts and lines staff draw on the sheet
+    add_scan(doc, decorate(scan_page([(paw_image(BLACK, 8), (820, 600))])), [("Rosie Parker", 200, 640, 30)], False, 8)
+    save("scan_007.pdf", doc, outputs=["Rosie Parker.svg"], inks=[BLACK])
 
     (out / "broken.pdf").write_bytes(b"%PDF-1.4 this is not really a pdf")
     expected["broken.pdf"] = dict(outputs=[], inks=[])

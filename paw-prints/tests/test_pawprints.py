@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -59,24 +60,30 @@ def test_report_lists_every_page(batch):
     assert rows[("broken.pdf", "1")]["status"] == "error"
 
 
-def test_svgs_have_transparent_background_and_ink_color(batch):
+def test_svgs_are_grayscale_paws_on_transparent_background(batch):
     expected = {o: ink for e in batch["expected"].values() for o, ink in zip(e["outputs"], e["inks"])}
     for name, ink in expected.items():
         svg = batch["out"] / name
         if not svg.exists():
             continue  # naming depends on OCR; covered by test_every_scan_gets_the_right_file
+        text = svg.read_text(encoding="utf-8")
+        fills = re.findall(r'fill="#([0-9A-Fa-f]{6})"', text)
+        assert fills and all(c[0:2] == c[2:4] == c[4:6] for c in fills), f"{name}: not grayscale"
         px = render(svg)
         alpha = px[..., 3]
         border = np.concatenate([alpha[:3].ravel(), alpha[-3:].ravel(), alpha[:, :3].ravel(), alpha[:, -3:].ravel()])
         assert border.max() == 0, f"{name}: background is not transparent at the edges"
         opaque = px[alpha == 255][:, :3].astype(int)
         assert 0.2 < len(opaque) / alpha.size < 0.7, f"{name}: paw coverage looks wrong"
-        assert np.abs(np.median(opaque, axis=0) - ink).max() < 30, f"{name}: ink color changed"
+        gray = 0.299 * ink[0] + 0.587 * ink[1] + 0.114 * ink[2]
+        assert abs(np.median(opaque) - gray) < 30, f"{name}: ink shade changed"
         assert (opaque.min(axis=1) > 200).mean() < 0.01, f"{name}: white or pale fill left in the SVG"
-        # The paw is 76 mm wide/tall; a label left in the SVG would make it much bigger.
-        root = pp.ET.fromstring(svg.read_text(encoding="utf-8"))
-        assert float(root.get("width").removesuffix("mm")) < 100
-        assert float(root.get("height").removesuffix("mm")) < 100
+        # The paw is 76 mm across (82 mm with margins). A label, heart or line left in the SVG
+        # would make it bigger.
+        root = pp.ET.fromstring(text)
+        if "- 2" not in name:  # page 2 of scan_006 has a smaller paw
+            assert 80 < float(root.get("width").removesuffix("mm")) < 85, f"{name}: more than the paw"
+            assert 76 < float(root.get("height").removesuffix("mm")) < 81, f"{name}: more than the paw"
 
 
 def test_second_page_keeps_its_own_paw(batch):
@@ -163,3 +170,21 @@ def test_background_check_catches_full_canvas_shape():
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm" viewBox="0 0 100 100">'
            '<path d="M0 0 L100 0 L100 100 L0 100 Z" fill="#FFFFFF"/></svg>')
     assert "covers the whole image" in pp.background_problem(svg)
+
+
+def test_colored_marks_dropped_only_when_paw_ink_is_gray():
+    rgb = np.full((40, 40, 3), 240, np.uint8)
+    rgb[:30, :30] = (30, 30, 32)  # black paw ink
+    rgb[32:, 32:] = (200, 30, 45)  # red heart
+    ink = rgb.min(axis=2) < 200
+    kept = pp.drop_colored_marks(ink, rgb)
+    assert kept[:30, :30].all() and not kept[32:, 32:].any()
+    rgb[:30, :30] = (92, 48, 30)  # paw printed in brown ink: color can't separate it, keep all
+    assert pp.drop_colored_marks(ink, rgb).sum() == ink.sum()
+
+
+def test_lines_alone_are_not_a_paw():
+    ink = np.zeros((1000, 1000), bool)
+    ink[500:506, 100:900] = True  # a 0.5 mm pen line
+    ink[100:900, 200:206] = True
+    assert pp.paw_region(ink, 300) is None
