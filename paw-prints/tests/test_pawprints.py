@@ -188,3 +188,11 @@ def test_lines_alone_are_not_a_paw():
     ink[500:506, 100:900] = True  # a 0.5 mm pen line
     ink[100:900, 200:206] = True
     assert pp.paw_region(ink, 300) is None
+
+
+def test_background_check_catches_pale_card_but_not_a_dark_paw():
+    head = '<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm" viewBox="0 0 1261 1865">'
+    card = '<path d="M0 0 L1189 0 L1189 1793 L0 1793 Z" fill="#FEFEFE" transform="translate(36,36)"/>'
+    paw = '<path d="M0 0 L1100 0 L1100 1700 L0 1700 Z" fill="#1C1C1C" transform="translate(80,80)"/>'
+    assert "pale shape" in pp.background_problem(head + card + "</svg>")  # 94% wide: the Brown - 2 case
+    assert pp.background_problem(head + paw + "</svg>") == ""

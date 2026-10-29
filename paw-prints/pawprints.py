@@ -323,24 +323,39 @@ def color_distance2(rgb: np.ndarray, paper: np.ndarray) -> np.ndarray:
     return lut[0][rgb[..., 0]] + lut[1][rgb[..., 1]] + lut[2][rgb[..., 2]]
 
 
-def ink_mask(rgb: np.ndarray, threshold: float | None) -> tuple[np.ndarray, np.ndarray]:
-    """(mask that is True wherever the page differs from the paper, the paper color)."""
+def luminance(rgb: np.ndarray) -> np.ndarray:
+    r, g, b = (rgb[..., i].astype(np.uint16) for i in range(3))
+    return ((77 * r + 150 * g + 29 * b) >> 8).astype(np.uint8)
+
+
+def paper_brightness(lum: np.ndarray, dpi: int) -> np.ndarray:
+    """How bright the paper is around each pixel: the bright end of a ~8 cm neighborhood.
+
+    Measured locally, not from the page edge, because a card or sheet often sits on a scanner
+    lid of a slightly different white. Comparing against the wrong white turned whole cards into "ink".
+    """
+    h, w = lum.shape
+    f = max(1, round(dpi / 10))  # 10 DPI is plenty for something that changes this slowly
+    hh, ww = math.ceil(h / f), math.ceil(w / f)
+    padded = np.pad(lum, ((0, hh * f - h), (0, ww * f - w)), mode="edge").astype(np.float32)
+    small = padded.reshape(hh, f, ww, f).mean(axis=(1, 3))
+    # 90th percentile, so a big dark pad still has enough paper in its window to measure.
+    small = ndimage.percentile_filter(small, 90, size=max(3, round(80 / 25.4 * dpi / f)))
+    return np.asarray(Image.fromarray(small, "F").resize((w, h), Image.BILINEAR))
+
+
+def ink_mask(rgb: np.ndarray, threshold: float | None, dpi: int) -> np.ndarray:
+    """True wherever the page is noticeably darker than the paper around it."""
     h, w, _ = rgb.shape
-    band = max(4, int(min(h, w) * 0.02))
-    border = np.concatenate(
-        [rgb[:band].reshape(-1, 3), rgb[-band:].reshape(-1, 3), rgb[:, :band].reshape(-1, 3), rgb[:, -band:].reshape(-1, 3)]
-    ).astype(np.float32)
-    paper = np.median(border, axis=0)
-    if threshold is None:
-        noise = np.percentile(np.sqrt(((border - paper) ** 2).sum(axis=1)), 95)
-        threshold = min(max(40.0, noise * 1.5), 90.0)
-    ink = ndimage.binary_opening(color_distance2(rgb, paper) > threshold**2, structure=np.ones((2, 2), bool))
+    lum = luminance(rgb)
+    darker = paper_brightness(lum, dpi) - lum
+    ink = ndimage.binary_opening(darker > (threshold or 25), structure=np.ones((2, 2), bool))
 
     # Scanner edge shadows hug the page border; nothing on the outer 1% is paw.
     edge = max(2, int(min(h, w) * 0.01))
     ink[:edge] = ink[-edge:] = False
     ink[:, :edge] = ink[:, -edge:] = False
-    return ink, paper
+    return ink
 
 
 def is_printed_text(line: TextLine, ink: np.ndarray) -> bool:
@@ -396,10 +411,11 @@ def paw_region(ink: np.ndarray, dpi: int) -> np.ndarray | None:
     if count == 0:
         return None
     areas = np.bincount(cores.ravel(), minlength=count + 1)
-    blobs = []  # roundish solid shapes, like pads; not long bars or frames
+    blobs = []  # roundish solid shapes, like pads: not bars, frames, cards or stickers
     for idx, (ys, xs) in enumerate(ndimage.find_objects(cores), start=1):
         bh, bw = ys.stop - ys.start, xs.stop - xs.start
-        if areas[idx] / (bh * bw) >= 0.3 and max(bh, bw) <= 3 * min(bh, bw):
+        fill = areas[idx] / (bh * bw)
+        if 0.3 <= fill <= 0.9 and max(bh, bw) <= 3 * min(bh, bw) and max(bh, bw) <= 160 * mm:
             blobs.append(idx)
     if not blobs:
         return None
@@ -469,13 +485,15 @@ def isolate_paw(ink: np.ndarray, rgb: np.ndarray, lines: list[TextLine], dpi: in
     return ink, "", warning
 
 
-def paw_rgba(rgb: np.ndarray, mask: np.ndarray, paper: np.ndarray, dpi: int) -> np.ndarray:
+def paw_rgba(rgb: np.ndarray, mask: np.ndarray, ink: np.ndarray, dpi: int) -> np.ndarray:
     """Crop to the paw and make everything that is not ink fully transparent."""
     ys, xs = np.nonzero(mask)
     margin = round(2 / 25.4 * dpi)
     y0, y1 = max(0, ys.min() - margin), min(rgb.shape[0], ys.max() + margin + 1)
     x0, x1 = max(0, xs.min() - margin), min(rgb.shape[1], xs.max() + margin + 1)
     crop = np.array(Image.fromarray(rgb[y0:y1, x0:x1]).filter(ImageFilter.MedianFilter(3)))
+    bare = ~ink[y0:y1, x0:x1]
+    paper = np.median(crop[bare], axis=0) if bare.any() else np.full(3, 255.0)  # paper right here
     dist2 = color_distance2(crop, paper)
     keep = mask[y0:y1, x0:x1]
     # Pixels that are mostly paper (under 30% of the ink's strength) become transparent too,
@@ -547,8 +565,13 @@ def background_problem(svg: str) -> str:
         if m:
             tx, ty = float(m.group(1)), float(m.group(2))
         xs, ys = [n + tx for n in nums[0::2]], [n + ty for n in nums[1::2]]
-        if (max(xs) - min(xs)) >= 0.95 * vw and (max(ys) - min(ys)) >= 0.95 * vh:
+        bw, bh = max(xs) - min(xs), max(ys) - min(ys)
+        if bw >= 0.95 * vw and bh >= 0.95 * vh:
             return f"a shape filled {path.get('fill')} covers the whole image"
+        fill = path.get("fill", "")
+        pale = re.fullmatch(r"#[0-9A-Fa-f]{6}", fill) and min(int(fill[i:i + 2], 16) for i in (1, 3, 5)) >= 200
+        if pale and bw * bh >= 0.5 * vw * vh:
+            return f"a pale shape filled {fill} covers most of the image"
     return ""
 
 
@@ -588,7 +611,7 @@ def convert_page(page: pymupdf.Page, opts: Options, backend: str, result: PageRe
     rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3)
     img = Image.fromarray(rgb)
 
-    ink, paper = ink_mask(rgb, opts.threshold)
+    ink = ink_mask(rgb, opts.threshold, opts.dpi)
 
     def real_text(found: list[TextLine]) -> list[TextLine]:
         return merge_row_fragments([l for l in found if l.conf >= 0.2 and is_printed_text(l, ink)])
@@ -615,7 +638,7 @@ def convert_page(page: pymupdf.Page, opts: Options, backend: str, result: PageRe
         result.preview_png = label_preview(img, [] if warning else lines)
     if opts.dry_run:
         return
-    svg = trace_svg(paw_rgba(rgb, mask, paper, opts.dpi), opts.dpi, opts.detail)
+    svg = trace_svg(paw_rgba(rgb, mask, ink, opts.dpi), opts.dpi, opts.detail)
     problem = background_problem(svg)
     if problem:
         result.status, result.reason = "review", f"possible background left in SVG: {problem}"
@@ -721,7 +744,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ocr", choices=["auto", "vision", "tesseract", "none"], default="auto",
                         help="text reader for labels (default: Apple Vision on a Mac)")
     parser.add_argument("--threshold", type=float,
-                        help="how different from the paper a pixel must be to count as ink (default: automatic, ~40)")
+                        help="how much darker than the paper a pixel must be to count as ink (0-255, default: 25)")
     parser.add_argument("--min-confidence", type=float, default=0.5,
                         help="flag names read with lower OCR confidence (0-1, default: 0.5)")
     parser.add_argument("--name-pattern",

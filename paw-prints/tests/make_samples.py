@@ -22,7 +22,7 @@ BLACK = (28, 28, 30)
 RED = (200, 30, 45)
 
 
-def paw_image(ink: tuple[int, int, int], seed: int, size_px: int = 900) -> Image.Image:
+def paw_image(ink: tuple[int, int, int], seed: int, size_px: int = 900, faint: bool = False) -> Image.Image:
     """RGBA paw: a main pad and four toes with mottled ink and paper-colored skin gaps."""
     rng = np.random.default_rng(seed)
     s = size_px
@@ -36,10 +36,12 @@ def paw_image(ink: tuple[int, int, int], seed: int, size_px: int = 900) -> Image
     # Skin texture: little paper-colored gaps where the ink did not take.
     gaps = Image.new("L", (s, s), 0)
     g = ImageDraw.Draw(gaps)
-    for _ in range(260):
+    for _ in range(900 if faint else 260):
         x, y, r = rng.uniform(0, s), rng.uniform(0, s), rng.uniform(2, 7)
         g.ellipse((x - r, y - r, x + r, y + r), fill=255)
     alpha = np.asarray(shape, np.float32) / 255 * (1 - np.asarray(gaps, np.float32) / 255 * 0.85)
+    if faint:  # light pressure: patchy, half-strength ink
+        alpha *= 0.55 + 0.45 * (rng.random((s, s)) > 0.5)
     shade = 1 + rng.normal(0, 0.12, (s // 30 + 1, s // 30 + 1))
     shade = np.asarray(Image.fromarray(shade.astype(np.float32)).resize((s, s), Image.BILINEAR))
     color = np.clip(np.array(ink, np.float32)[None, None, :] * shade[..., None], 0, 255)
@@ -53,6 +55,17 @@ def scan_page(paws: list[tuple[Image.Image, tuple[int, int]]], frame: tuple | No
         page.paste(paw, xy, paw)
     if frame:
         ImageDraw.Draw(page).rectangle(frame, outline=(120, 120, 120), width=4)
+    return page
+
+
+def card_page(lid: tuple, card: tuple, paw: Image.Image) -> Image.Image:
+    """A 4x6" card on the scanner glass: lid all around, shadow lines on the card's top and left edges."""
+    page = Image.new("RGB", (PAGE_W * DPI // 72, PAGE_H * DPI // 72), lid)
+    d = ImageDraw.Draw(page)
+    x0, y0, x1, y1 = 150, 150, 150 + 4 * DPI, 150 + 6 * DPI
+    d.rectangle((x0, y0, x1, y1), fill=card)
+    d.line([(x0, y1), (x0, y0), (x1, y0)], fill=(70, 70, 70), width=5)
+    page.paste(paw, (x0 + 150, y0 + 250), paw)
     return page
 
 
@@ -143,6 +156,16 @@ def make_samples(out: Path) -> dict[str, dict]:
     doc = pymupdf.open()  # black ink plus the hearts and lines staff draw on the sheet
     add_scan(doc, decorate(scan_page([(paw_image(BLACK, 8), (820, 600))])), [("Rosie Parker", 200, 640, 30)], False, 8)
     save("scan_007.pdf", doc, outputs=["Rosie Parker.svg"], inks=[BLACK])
+
+    doc = pymupdf.open()  # white card on a grayer scanner lid, with a faint print
+    add_scan(doc, card_page((226, 226, 224), (254, 254, 253), paw_image(BLACK, 9, faint=True)),
+             [("Brownie Cole", 80, 400, 26)], False, 9)
+    save("scan_008.pdf", doc, outputs=["Brownie Cole.svg"], inks=[BLACK])
+
+    doc = pymupdf.open()  # cream card on a white lid
+    add_scan(doc, card_page((250, 250, 250), (240, 232, 214), paw_image(BLACK, 10)),
+             [("Pepper Lane", 80, 400, 26)], False, 10)
+    save("scan_009.pdf", doc, outputs=["Pepper Lane.svg"], inks=[BLACK])
 
     (out / "broken.pdf").write_bytes(b"%PDF-1.4 this is not really a pdf")
     expected["broken.pdf"] = dict(outputs=[], inks=[])

@@ -107,7 +107,7 @@ To use options, run the script in Terminal from this folder:
 | `--out FOLDER` | Put the results somewhere else. |
 | `--name-pattern REGEX` | Tell it exactly where the name is, if your labels have a fixed layout. Example: `--name-pattern 'Pet: (?P<name>.+)'` |
 | `--min-confidence 0.5` | Flag names read with OCR confidence below this (0–1). |
-| `--threshold 40` | How different from the paper a pixel must be to count as ink. Lower it if faint ink is lost; raise it if paper smudges show up. It's automatic by default. |
+| `--threshold 25` | How much darker than the paper around it a spot must be to count as ink (0–255). Lower it if faint ink is lost; raise it if paper smudges or card edges show up. Default is 25. |
 | `--workers N` | How many PDFs to process at once. Defaults to one per CPU core, up to 8. |
 | `--open` | Open the results folder in Finder when done. The launcher uses this. |
 
