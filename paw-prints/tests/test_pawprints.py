@@ -145,3 +145,20 @@ def test_background_check_catches_pale_card_but_not_a_dark_paw():
     paw = '<path d="M0 0 L1100 0 L1100 1700 L0 1700 Z" fill="#1C1C1C" transform="translate(80,80)"/>'
     assert "pale shape" in pp.background_problem(head + card + "</svg>")  # 94% wide: the Brown - 2 case
     assert pp.background_problem(head + paw + "</svg>") == ""
+
+
+def test_image_detail_embeds_a_small_grayscale_png(tmp_path):
+    """--detail image: no traced paths, a PNG inside, real-size viewBox, transparent outside the paw."""
+    scans = tmp_path / "scans"
+    make_samples(scans)
+    out = tmp_path / "out"
+    pp.main([str(scans), "--detail", "image", "--out", str(out), "--workers", "2"])  # exit code is for the broken sample
+    svg_path = out / "Buddy Smith.svg"
+    text = svg_path.read_text(encoding="utf-8")
+    assert "<path" not in text and 'href="data:image/png;base64,' in text
+    assert re.search(r'width="\d+\.\d+mm" height="\d+\.\d+mm" viewBox="0 0 \d+ \d+"', text)
+    assert svg_path.stat().st_size < 1_000_000  # the traced version of this paw is several MB
+    img = render(svg_path)
+    assert img[0, 0, 3] == 0 and img[-1, -1, 3] == 0  # corners are transparent
+    opaque = img[img[..., 3] > 0]
+    assert len(opaque) > 0 and np.all(opaque[:, 0] == opaque[:, 1]) and np.all(opaque[:, 1] == opaque[:, 2])

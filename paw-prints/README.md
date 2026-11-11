@@ -96,6 +96,7 @@ To use options, run the script in Terminal from this folder:
 | Option | What it does |
 |---|---|
 | `--detail low/medium/high` | How much ink texture and shading to keep. `medium` (default) traces at double resolution, about 5–7 MB per paw. `high` keeps even more shades of gray, about 8 MB. `low` makes smaller files, about 2 MB, but the fine texture gets softer. |
+| `--detail image` | Don't trace at all: the SVG holds the paw as a grayscale picture (PNG) with a transparent background, at its real size. Every bit of scan detail survives and files are a few hundred KB. Use this for the Glowforge, which can't load the traced files; it engraves the picture directly. |
 | `--out FOLDER` | Put the results somewhere else. |
 | `--threshold 25` | How much darker than the paper around it a spot must be to count as ink (0–255). Lower it if faint ink is lost; raise it if paper smudges or card edges show up. Default is 25. |
 | `--workers N` | How many PDFs to process at once. Defaults to one per CPU core, up to 8. |

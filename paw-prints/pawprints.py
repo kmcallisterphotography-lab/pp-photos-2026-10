@@ -18,6 +18,7 @@ Run ./pawprints.py --help for all options.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import io
 import math
@@ -39,7 +40,7 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 from scipy.spatial import ConvexHull
 
-VERSION = "2026-10-29d"
+VERSION = "2026-11-06"
 REVIEW_DIR = "NEEDS_REVIEW"
 REPORT_NAME = "report.csv"
 MIN_PAW_INK_MM2 = 150  # a page with less ink than this inside the paw region has no paw
@@ -256,6 +257,29 @@ def trace_svg(gray: np.ndarray, keep: np.ndarray, dpi: int, detail: str) -> str:
     )
 
 
+def image_svg(gray: np.ndarray, keep: np.ndarray, dpi: int) -> str:
+    """SVG holding the paw as an embedded grayscale PNG with a transparent background.
+
+    No tracing, so every bit of scan detail survives and the file is a few hundred KB instead
+    of several MB of paths. Added 2026-11-06 because the Glowforge app would not import the
+    traced files (13,000+ paths each).
+    """
+    h, w = gray.shape
+    # Gray + alpha (2 channels, not 4): half the bytes of an RGBA PNG, same picture.
+    la = np.dstack([np.where(keep, gray, 255).astype(np.uint8), np.where(keep, 255, 0).astype(np.uint8)])
+    png = io.BytesIO()
+    Image.fromarray(la, "LA").save(png, "PNG", optimize=True)
+    data = base64.b64encode(png.getvalue()).decode("ascii")
+    mm_w, mm_h = w / dpi * 25.4, h / dpi * 25.4
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+        f'width="{mm_w:.2f}mm" height="{mm_h:.2f}mm" viewBox="0 0 {w} {h}">\n'
+        f'<image x="0" y="0" width="{w}" height="{h}" href="data:image/png;base64,{data}" '
+        f'xlink:href="data:image/png;base64,{data}"/>\n</svg>\n'
+    )
+
+
 def background_problem(svg: str) -> str:
     """Describe any shape that looks like a leftover background, or return ''."""
     root = ET.fromstring(svg)
@@ -313,8 +337,12 @@ def convert_page(page: pymupdf.Page, opts: Options, result: PageResult) -> None:
     if no_paw:
         result.status, result.reason = "skipped", no_paw
         return
-    svg = trace_svg(*paw_rgba(rgb, mask, opts.dpi), opts.dpi, opts.detail)
-    problem = background_problem(svg)
+    if opts.detail == "image":
+        svg = image_svg(*paw_rgba(rgb, mask, opts.dpi), opts.dpi)
+        problem = ""  # nothing is traced, so there is no shape to mistake for a background
+    else:
+        svg = trace_svg(*paw_rgba(rgb, mask, opts.dpi), opts.dpi, opts.detail)
+        problem = background_problem(svg)
     result.status, result.svg = ("review" if problem else "ok"), svg
     if problem:
         result.reason = f"possible background left in SVG: {problem}"
@@ -411,7 +439,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("folder", type=Path, help="folder of PDF scans (subfolders are included)")
     parser.add_argument("--out", type=Path, help="output folder (default: '<folder>-svg' next to the input)")
-    parser.add_argument("--detail", choices=DETAIL_PRESETS, default="medium", help="ink texture detail (default: medium)")
+    parser.add_argument("--detail", choices=[*DETAIL_PRESETS, "image"], default="medium",
+                        help="ink texture detail (default: medium); 'image' embeds the scan as a PNG instead of "
+                             "tracing it: exact detail, small files, imports into Glowforge")
     parser.add_argument("--dpi", type=int, default=300, help="scan resolution to work at (default: 300)")
     parser.add_argument("--workers", type=int, default=min(os.cpu_count() or 2, 8),
                         help="PDFs to process at once (default: one per CPU core, up to 8)")
